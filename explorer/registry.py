@@ -90,13 +90,31 @@ class ProjectRegistry:
                     releases_count INTEGER,
                     latest_release TEXT,
                     latest_release_at TEXT,
+                    avg_release_interval_days INTEGER,
                     lines_of_code INTEGER,
                     file_count INTEGER,
+                    repo_size_kb INTEGER,
                     primary_language TEXT,
                     language_breakdown TEXT DEFAULT '{}',
+                    license TEXT DEFAULT '',
+                    topics TEXT DEFAULT '',
+                    repo_created_at TEXT DEFAULT '',
+                    last_pushed_at TEXT DEFAULT '',
                     FOREIGN KEY (project_slug) REFERENCES projects(slug)
                 )
             """)
+            # Migrations: add new columns to existing databases
+            existing_stats = {r[1] for r in conn.execute("PRAGMA table_info(project_stats)")}
+            for col, defn in [
+                ("avg_release_interval_days", "INTEGER DEFAULT 0"),
+                ("repo_size_kb", "INTEGER DEFAULT 0"),
+                ("license", "TEXT DEFAULT ''"),
+                ("topics", "TEXT DEFAULT ''"),
+                ("repo_created_at", "TEXT DEFAULT ''"),
+                ("last_pushed_at", "TEXT DEFAULT ''"),
+            ]:
+                if col not in existing_stats:
+                    conn.execute(f"ALTER TABLE project_stats ADD COLUMN {col} {defn}")
 
     def add(self, project: Project) -> None:
         data = {**asdict(project), "collections": json.dumps(project.collections)}

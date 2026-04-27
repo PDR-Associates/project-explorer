@@ -12,7 +12,6 @@ class StatsAgent(BaseExplorerAgent):
     """
     Handles statistical queries (commits, stars, contributors, releases, LOC, etc.).
     Sources: SQLite project_stats table (fast, offline) + live GitHub API (optional).
-    Renders charts via Plotext (terminal) or Plotly (web/export).
 
     Does NOT use the vector store — all data is structured, not semantic.
     """
@@ -44,7 +43,6 @@ class StatsAgent(BaseExplorerAgent):
                 "SELECT * FROM project_stats WHERE project_slug = ? ORDER BY fetched_at DESC LIMIT 1",
                 (project_slug,),
             ).fetchone()
-            # Fetch up to 4 historical rows for trend context
             history = conn.execute(
                 """SELECT fetched_at, stars, commits_30d, forks
                    FROM project_stats WHERE project_slug = ?
@@ -59,22 +57,65 @@ class StatsAgent(BaseExplorerAgent):
             return ""
 
         d = dict(row)
+
+        def _val(key, suffix=""):
+            v = d.get(key)
+            if v is None or v == "":
+                return "N/A"
+            return f"{v}{suffix}"
+
+        def _loc_fmt(n):
+            if n is None:
+                return "N/A"
+            n = int(n)
+            if n >= 1_000_000:
+                return f"{n / 1_000_000:.1f}M (estimated)"
+            if n >= 1_000:
+                return f"{n / 1_000:.1f}K (estimated)"
+            return f"{n} (estimated)"
+
+        def _size_fmt(kb):
+            if kb is None:
+                return "N/A"
+            kb = int(kb)
+            if kb >= 1024:
+                return f"{kb / 1024:.1f} MB"
+            return f"{kb} KB"
+
         lines = [
             f"Project: {project_slug}",
-            f"Stars: {d.get('stars', 'N/A')}",
-            f"Forks: {d.get('forks', 'N/A')}",
-            f"Watchers: {d.get('watchers', 'N/A')}",
-            f"Open Issues: {d.get('open_issues', 'N/A')}",
-            f"Contributors: {d.get('contributors_count', 'N/A')}",
-            f"Commits (last 30 days): {d.get('commits_30d', 'N/A')}",
-            f"Commits (last 90 days): {d.get('commits_90d', 'N/A')}",
-            f"Total Releases: {d.get('releases_count', 'N/A')}",
-            f"Latest Release: {d.get('latest_release', 'N/A')}",
-            f"Latest Release Date: {d.get('latest_release_at', 'N/A')}",
-            f"File Count: {d.get('file_count', 'N/A')}",
-            f"Primary Language: {d.get('primary_language', 'N/A')}",
-            f"Language Breakdown (bytes of code): {d.get('language_breakdown', 'N/A')}",
-            f"Stats as of: {d.get('fetched_at', 'N/A')}",
+            "",
+            "── Repository ──────────────────────────",
+            f"  License:            {_val('license')}",
+            f"  Topics:             {_val('topics') or 'none'}",
+            f"  Created:            {_val('repo_created_at', '')[:10] or 'N/A'}",
+            f"  Last pushed:        {_val('last_pushed_at', '')[:10] or 'N/A'}",
+            f"  Size:               {_size_fmt(d.get('repo_size_kb'))}",
+            f"  Primary language:   {_val('primary_language')}",
+            "",
+            "── Code ────────────────────────────────",
+            f"  Files:              {_val('file_count')}",
+            f"  Lines of code:      {_loc_fmt(d.get('lines_of_code'))}",
+            f"  Language breakdown: {_val('language_breakdown')}",
+            "",
+            "── Community ───────────────────────────",
+            f"  Stars:              {_val('stars')}",
+            f"  Forks:              {_val('forks')}",
+            f"  Watchers:           {_val('watchers')}",
+            f"  Contributors:       {_val('contributors_count')}",
+            f"  Open issues:        {_val('open_issues')}",
+            "",
+            "── Activity ────────────────────────────",
+            f"  Commits (30 days):  {_val('commits_30d')}",
+            f"  Commits (90 days):  {_val('commits_90d')}",
+            "",
+            "── Releases ────────────────────────────",
+            f"  Total releases:     {_val('releases_count')}",
+            f"  Latest release:     {_val('latest_release')}",
+            f"  Latest release at:  {_val('latest_release_at', '')[:10] or 'N/A'}",
+            f"  Avg interval:       {_val('avg_release_interval_days', ' days')}",
+            "",
+            f"Stats as of: {_val('fetched_at', '')[:19] or 'N/A'}",
         ]
 
         if len(history) > 1:
@@ -84,8 +125,7 @@ class StatsAgent(BaseExplorerAgent):
             fork_diff = (newest.get("forks") or 0) - (oldest.get("forks") or 0)
             since = (oldest.get("fetched_at") or "")[:10]
             if star_diff or fork_diff:
-                lines.append("")
-                lines.append(f"Trends since {since}:")
+                lines += ["", f"Trends since {since}:"]
                 if star_diff:
                     lines.append(f"  Stars: {'+' if star_diff > 0 else ''}{star_diff}")
                 if fork_diff:
