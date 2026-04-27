@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import hashlib
-import threading
 from typing import ClassVar
 
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -16,7 +16,6 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
-    Markdown,
     Static,
 )
 
@@ -125,12 +124,6 @@ class ProjectExplorerApp(App):
     ChatMessage {
         margin: 0 0 1 0;
     }
-    .msg-you {
-        color: $text;
-    }
-    .msg-assistant {
-        color: $text;
-    }
     ProjectItem {
         padding: 0 1;
     }
@@ -145,13 +138,17 @@ class ProjectExplorerApp(App):
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("ctrl+c", "quit", "Quit"),
         Binding("tab", "focus_next", "Switch pane", show=False),
-        Binding("f", "feedback", "Feedback (f=👍 n=👎)", show=True),
-        Binding("r", "refresh_project", "Refresh project", show=True),
+        Binding("f", "feedback", "Feedback", show=True),
+        Binding("r", "refresh_project", "Refresh", show=True),
     ]
 
     selected_project: reactive[str | None] = reactive(None)
     last_query_hash: reactive[str | None] = reactive(None)
-    _thinking: bool = False
+    _awaiting_feedback: bool = False
+
+    def __init__(self, rag_system) -> None:
+        super().__init__()
+        self._rag = rag_system
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -164,7 +161,7 @@ class ProjectExplorerApp(App):
                 yield Static("", id="status-bar")
                 with Horizontal(id="input-row"):
                     yield Input(
-                        placeholder="Ask a question… (Tab to switch pane)",
+                        placeholder="Ask a question… (Tab to switch pane, f=feedback, r=refresh)",
                         id="query-input",
                     )
         yield Footer()
@@ -174,7 +171,7 @@ class ProjectExplorerApp(App):
         self.query_one("#query-input").focus()
         self._append_message(
             "Assistant",
-            "Welcome to **Project Explorer**! Select a project in the sidebar (Tab) "
+            "Welcome to Project Explorer! Select a project in the sidebar (Tab) "
             "or ask a question across all projects.",
         )
 
@@ -188,7 +185,7 @@ class ProjectExplorerApp(App):
         for p in projects:
             lv.append(ProjectItem(p.slug, p.display_name, p.status.value, len(p.collections)))
         if not projects:
-            lv.append(ListItem(Label("[dim]No projects yet — run 'project-explorer add'[/dim]")))
+            lv.append(ListItem(Label("[dim]No projects — run 'project-explorer add'[/dim]")))
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if isinstance(event.item, ProjectItem):
@@ -205,21 +202,19 @@ class ProjectExplorerApp(App):
         self._append_message("You", query)
         self.last_query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
         self._set_status("Thinking…")
-        self._thinking = True
-        threading.Thread(target=self._run_query, args=(query,), daemon=True).start()
+        self._run_query(query)
 
+    @work(thread=True)
     def _run_query(self, query: str) -> None:
         try:
-            from explorer.rag_system import RAGSystem
-            response = RAGSystem().query(query, project_slug=self.selected_project)
+            response = self._rag.query(query, project_slug=self.selected_project)
         except Exception as exc:
-            response = f"[red]Error:[/red] {exc}"
+            response = f"Error: {exc}"
         self.call_from_thread(self._on_response, response)
 
     def _on_response(self, response: str) -> None:
-        self._thinking = False
         self._append_message("Assistant", response)
-        self._set_status("Press [bold]f[/bold] then y/n to give feedback  |  r to refresh project")
+        self._set_status("f=👍/👎 feedback  |  r=refresh project  |  Tab=switch pane")
 
     def _append_message(self, role: str, text: str) -> None:
         log = self.query_one("#chat-log")
@@ -229,26 +224,25 @@ class ProjectExplorerApp(App):
     def _set_status(self, text: str) -> None:
         self.query_one("#status-bar", Static).update(text)
 
-    # ── actions ───────────────────────────────────────────────────────────────
+    # ── actions ─────���─────────────────────────────────────────────────────────
 
     def action_feedback(self) -> None:
         if not self.last_query_hash:
             self._set_status("No query to give feedback on yet.")
             return
-        self._set_status("Feedback: y = 👍  n = 👎  (press key now)")
-        # Capture the next keypress for feedback
+        self._set_status("Feedback: y=👍  n=👎  (press key)")
         self._awaiting_feedback = True
 
     def on_key(self, event) -> None:
-        if getattr(self, "_awaiting_feedback", False):
-            from explorer.observability.metrics_collector import MetricsCollector
+        if self._awaiting_feedback:
             self._awaiting_feedback = False
+            from explorer.observability.metrics_collector import MetricsCollector
             if event.key == "y":
                 MetricsCollector().record_feedback(self.last_query_hash, 1)
                 self._set_status("👍 Feedback recorded — thanks!")
             elif event.key == "n":
                 MetricsCollector().record_feedback(self.last_query_hash, -1)
-                self._set_status("👎 Feedback recorded — we'll improve!")
+                self._set_status("👎 Feedback recorded.")
             else:
                 self._set_status("Feedback cancelled.")
             event.prevent_default()
@@ -257,11 +251,11 @@ class ProjectExplorerApp(App):
         if not self.selected_project:
             self._set_status("Select a project in the sidebar first (Tab).")
             return
-        slug = self.selected_project
-        self._set_status(f"Refreshing {slug}…")
-        self._append_message("Assistant", f"Starting refresh for **{slug}**…")
-        threading.Thread(target=self._run_refresh, args=(slug,), daemon=True).start()
+        self._set_status(f"Refreshing {self.selected_project}…")
+        self._append_message("Assistant", f"Starting refresh for **{self.selected_project}**…")
+        self._run_refresh(self.selected_project)
 
+    @work(thread=True)
     def _run_refresh(self, slug: str) -> None:
         try:
             from explorer.ingestion.incremental import IncrementalIndexer
@@ -275,7 +269,7 @@ class ProjectExplorerApp(App):
             else:
                 msg = f"Project **{slug}** not found."
         except Exception as exc:
-            msg = f"[red]Refresh failed:[/red] {exc}"
+            msg = f"Refresh failed: {exc}"
         self.call_from_thread(self._on_refresh_done, msg)
 
     def _on_refresh_done(self, msg: str) -> None:
@@ -285,8 +279,25 @@ class ProjectExplorerApp(App):
 
 
 def run() -> None:
-    """Entry point — launch the TUI."""
-    ProjectExplorerApp().run()
+    """
+    Pre-warm the RAG system (loads embedding model + Milvus connection) in the
+    main thread before Textual starts. This prevents gRPC/PyTorch FD conflicts
+    that occur when those libraries initialise inside a worker thread.
+    """
+    from explorer.rag_system import RAGSystem
+    from explorer.embeddings import get_embedding_model
+
+    # Force model + Milvus client init now, in the main thread
+    get_embedding_model()
+    rag = RAGSystem()
+    # Touch the store to open the gRPC connection before Textual's event loop
+    try:
+        from explorer.multi_collection_store import MultiCollectionStore
+        MultiCollectionStore()._get_client()
+    except Exception:
+        pass
+
+    ProjectExplorerApp(rag).run()
 
 
 if __name__ == "__main__":
