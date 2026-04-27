@@ -63,10 +63,14 @@ def ask(
     no_cache: bool = typer.Option(False, "--no-cache", help="Bypass query cache"),
 ):
     """Ask a one-shot question about a project (or all projects)."""
+    import hashlib
     from explorer.rag_system import RAGSystem
+    from explorer.observability.feedback_collector import FeedbackCollector
     system = RAGSystem()
     response = system.query(query, project_slug=project)
     console.print(response)
+    query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+    FeedbackCollector().prompt_and_collect(query_hash)
 
 
 @app.command()
@@ -100,6 +104,24 @@ def status():
     """Show environment health: services, projects, collection counts."""
     from explorer.dashboard.terminal_dashboard import print_status
     print_status(console)
+
+
+@app.command()
+def tui():
+    """Launch the full-screen Textual TUI (project sidebar + chat + feedback)."""
+    from explorer.tui.app import run
+    run()
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("0.0.0.0", help="Bind host"),
+    port: int = typer.Option(8080, help="Bind port"),
+):
+    """Start the AgentStack A2A server (exposes agents to beeai.dev platform)."""
+    from explorer.agentstack_server import run as agentstack_run
+    console.print(f"[cyan]Starting AgentStack server on {host}:{port}[/cyan]")
+    agentstack_run(host=host, port=port)
 
 
 if __name__ == "__main__":

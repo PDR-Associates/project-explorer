@@ -42,6 +42,14 @@ class CompareAgent(BaseExplorerAgent):
     def _extract_project_slugs(self, query: str) -> list[str]:
         import re
         from explorer.registry import ProjectRegistry
-        known = {p.slug for p in ProjectRegistry().list_all()}
-        found = [slug for slug in known if slug in query.lower()]
+        known = {p.slug: p for p in ProjectRegistry().list_all()}
+        query_lower = query.lower()
+        found = []
+        for slug, project in known.items():
+            # Match slug (underscores or hyphens) or display name as whole word
+            slug_pattern = slug.replace("_", "[-_ ]")
+            display = re.escape(project.display_name.lower())
+            if re.search(rf"\b{slug_pattern}\b", query_lower) or \
+               re.search(rf"\b{display}\b", query_lower):
+                found.append(slug)
         return found

@@ -27,3 +27,7 @@ class InteractiveSession:
                 continue
             response = self.agent.handle(query, self.project_slug)
             self.console.print(f"\n[green]Assistant:[/green] {response}\n")
+            import hashlib
+            from explorer.observability.feedback_collector import FeedbackCollector
+            query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+            FeedbackCollector().prompt_and_collect(query_hash)

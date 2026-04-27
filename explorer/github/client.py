@@ -26,18 +26,36 @@ class GitHubClient:
         slug = self._url_to_slug(github_url)
         return self._gh.get_repo(slug)
 
+    def download_zipball(self, repo: Repository, dest_dir: "Path") -> "Path":
+        """
+        Download entire repo as a single zipball (1 API call) and extract it.
+        Returns the extracted repo root directory inside dest_dir.
+        Far more rate-limit-friendly than fetching files individually.
+        """
+        import io
+        import zipfile
+        from pathlib import Path
+        import requests
+
+        branch = repo.default_branch
+        url = f"https://api.github.com/repos/{repo.full_name}/zipball/{branch}"
+        token = get_config().github.token
+        headers = {"Authorization": f"token {token}"} if token else {}
+        resp = requests.get(url, headers=headers, stream=True, timeout=300)
+        resp.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            zf.extractall(dest_dir)
+        # GitHub zips have a single top-level dir named "owner-repo-sha"
+        subdirs = [d for d in Path(dest_dir).iterdir() if d.is_dir()]
+        return subdirs[0] if subdirs else Path(dest_dir)
+
     def list_files(self, repo: Repository, path: str = "", recursive: bool = True) -> list[str]:
-        """Return all file paths in the repo (shallow or recursive)."""
-        contents = repo.get_contents(path)
-        files = []
-        while contents:
-            item = contents.pop(0)
-            if item.type == "dir":
-                if recursive:
-                    contents.extend(repo.get_contents(item.path))
-            else:
-                files.append(item.path)
-        return files
+        """Return all file paths via git tree (1 API call). Kept for stats/incremental use."""
+        try:
+            tree = repo.get_git_tree(repo.default_branch, recursive=True)
+            return [e.path for e in tree.tree if e.type == "blob"]
+        except Exception:
+            return []
 
     def get_file_content(self, repo: Repository, path: str) -> str | None:
         try:

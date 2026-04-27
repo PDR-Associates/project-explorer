@@ -27,6 +27,9 @@ class IncrementalIndexer:
         self.client = GitHubClient()
 
     def refresh(self, project: Project) -> None:
+        import tempfile
+        from pathlib import Path
+
         repo = self.client.get_repo(project.github_url)
         latest_sha = self.client.get_latest_commit_sha(repo)
 
@@ -72,21 +75,29 @@ class IncrementalIndexer:
         store = MultiCollectionStore()
         pipeline = IngestionPipeline()
 
-        # Keep collections not being re-indexed
+        # Download repo once for all affected file-based collections
+        file_ctypes = {k: v for k, v in project_ctypes.items() if k != "release_notes"}
         surviving = [
             c for c in (project.collections or [])
             if not any(c == f"{project.slug}_{name}" for name in project_ctypes)
         ]
 
-        for name, ctype in project_ctypes.items():
-            collection_name = f"{project.slug}_{name}"
-            store.drop_collection(collection_name)
-            count = pipeline._ingest_collection(
-                project.github_url, project.slug, collection_name, ctype
-            )
-            if count > 0:
-                surviving.append(collection_name)
-                print(f"  {collection_name}: {count} chunks")
+        with tempfile.TemporaryDirectory() as tmp:
+            local_root = None
+            if file_ctypes:
+                print("Downloading repository...")
+                local_root = self.client.download_zipball(repo, Path(tmp))
+
+            for name, ctype in project_ctypes.items():
+                collection_name = f"{project.slug}_{name}"
+                store.drop_collection(collection_name)
+                count = pipeline._ingest_collection(
+                    repo, project.slug, collection_name, ctype,
+                    local_root if name != "release_notes" else None,
+                )
+                if count > 0:
+                    surviving.append(collection_name)
+                    print(f"  {collection_name}: {count} chunks")
 
         self.registry.update_indexed_at(project.slug, surviving)
         self.registry.update_status(project.slug, ProjectStatus.ACTIVE)
