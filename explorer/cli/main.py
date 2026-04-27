@@ -48,12 +48,14 @@ def remove(
 
 
 @app.command(name="list")
-def list_projects():
+def list_projects(
+    details: bool = typer.Option(False, "--details", "-d", help="Show collection names and vector counts"),
+):
     """List all registered projects and their status."""
     from explorer.cli.formatters import print_project_table
     from explorer.registry import ProjectRegistry
     projects = ProjectRegistry().list_all()
-    print_project_table(projects, console)
+    print_project_table(projects, console, details=details)
 
 
 @app.command()
@@ -80,6 +82,82 @@ def chat(
     """Start an interactive multi-turn chat session."""
     from explorer.cli.interactive import InteractiveSession
     InteractiveSession(project_slug=project).run()
+
+
+@app.command(name="add-docs")
+def add_docs(
+    slug: str = typer.Argument(help="Project slug"),
+    docs_url: Optional[str] = typer.Option(None, "--docs-url", help="Documentation site URL to ingest as web_docs"),
+    homepage_url: Optional[str] = typer.Option(None, "--homepage", help="Homepage URL to store on the project"),
+):
+    """Attach a documentation site or homepage to an already-registered project."""
+    from explorer.registry import ProjectRegistry
+    from explorer.multi_collection_store import MultiCollectionStore
+
+    registry = ProjectRegistry()
+    project = registry.get(slug)
+    if not project:
+        console.print(f"[red]Project '{slug}' not found.[/red]")
+        raise typer.Exit(1)
+
+    if homepage_url:
+        # Just update the metadata field — no ingestion needed
+        import sqlite3
+        conn = sqlite3.connect(registry.db_path)
+        conn.execute("UPDATE projects SET homepage_url = ? WHERE slug = ?", (homepage_url, project.slug))
+        conn.commit()
+        conn.close()
+        console.print(f"[green]Homepage URL updated for '{slug}'.[/green]")
+
+    if docs_url:
+        # Update stored docs_url
+        import sqlite3
+        conn = sqlite3.connect(registry.db_path)
+        conn.execute("UPDATE projects SET docs_url = ? WHERE slug = ?", (docs_url, project.slug))
+        conn.commit()
+        conn.close()
+        console.print(f"[cyan]Ingesting docs from {docs_url}...[/cyan]")
+        _ingest_web_docs(project, docs_url, registry)
+
+    if not docs_url and not homepage_url:
+        console.print("[yellow]Provide at least --docs-url or --homepage.[/yellow]")
+        raise typer.Exit(1)
+
+
+def _ingest_web_docs(project, docs_url: str, registry) -> None:
+    """Fetch a docs site via Docling and insert into the project's web_docs collection."""
+    from explorer.ingestion.doc_parser import DocParser, DocChunk
+    from explorer.ingestion.data_prep import DataPrep
+    from explorer.multi_collection_store import MultiCollectionStore
+    from config.collection_config import COLLECTION_TYPES
+
+    ctype = COLLECTION_TYPES.get("web_docs")
+    if not ctype:
+        console.print("[red]web_docs collection type not configured.[/red]")
+        return
+
+    collection_name = f"{project.slug}_web_docs"
+    parser = DocParser(ctype.chunk_size, ctype.chunk_overlap)
+
+    try:
+        chunks = parser.parse_url(docs_url, project.slug)
+    except Exception as exc:
+        console.print(f"[red]Failed to fetch docs:[/red] {exc}")
+        return
+
+    chunks = DataPrep().filter(chunks)
+    if not chunks:
+        console.print("[yellow]No content extracted from docs URL.[/yellow]")
+        return
+
+    store = MultiCollectionStore()
+    count = store.insert(collection_name, [c.text for c in chunks], [c.metadata for c in chunks])
+
+    collections = list(project.collections)
+    if collection_name not in collections:
+        collections.append(collection_name)
+    registry.update_indexed_at(project.slug, collections)
+    console.print(f"[green]Inserted {count} chunks into {collection_name}.[/green]")
 
 
 @app.command()
