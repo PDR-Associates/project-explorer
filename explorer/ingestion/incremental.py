@@ -1,0 +1,109 @@
+"""Incremental indexer — re-indexes only collection types affected by changed files."""
+from __future__ import annotations
+
+from pathlib import PurePath
+
+from explorer.github.client import GitHubClient
+from explorer.ingestion.pipeline import IngestionPipeline
+from explorer.multi_collection_store import MultiCollectionStore
+from explorer.registry import Project, ProjectRegistry, ProjectStatus
+
+
+class IncrementalIndexer:
+    """
+    Commit-diff based incremental update strategy:
+      1. Fetch latest commit SHA from GitHub
+      2. Compare against stored last_commit_sha in registry
+      3. git diff --name-only last_sha..HEAD → list of changed files
+      4. Determine which collection types are affected by the changed files
+      5. Drop and re-ingest only affected collections
+
+    Re-indexes at collection granularity (not per-file) to avoid the complexity
+    of Milvus delete-by-metadata-filter on arbitrary schemas.
+    """
+
+    def __init__(self) -> None:
+        self.registry = ProjectRegistry()
+        self.client = GitHubClient()
+
+    def refresh(self, project: Project) -> None:
+        repo = self.client.get_repo(project.github_url)
+        latest_sha = self.client.get_latest_commit_sha(repo)
+
+        last_sha = self._get_last_sha(project.slug)
+        if last_sha == latest_sha:
+            print(f"No changes since last index ({latest_sha[:8]})")
+            return
+
+        changed_files = self._get_changed_files(repo, last_sha, latest_sha)
+        n = len(changed_files)
+        print(f"{n} file{'s' if n != 1 else ''} changed since {last_sha[:8] if last_sha else 'initial index'}")
+
+        if not changed_files:
+            self._store_last_sha(project.slug, latest_sha)
+            return
+
+        # Find which collection types are touched by the changed files
+        from config.collection_config import COLLECTION_TYPES
+        affected_names = set()
+        for path in changed_files:
+            ext = PurePath(path).suffix.lower()
+            for ctype in COLLECTION_TYPES.values():
+                if ext in ctype.file_extensions:
+                    affected_names.add(ctype.name)
+
+        # release_notes are always worth refreshing when anything changed
+        affected_names.add("release_notes")
+
+        # Filter to collections the project actually has
+        project_ctypes = {
+            name: COLLECTION_TYPES[name]
+            for name in affected_names
+            if name in COLLECTION_TYPES
+            and f"{project.slug}_{name}" in (project.collections or [])
+        }
+
+        if not project_ctypes:
+            self._store_last_sha(project.slug, latest_sha)
+            return
+
+        print(f"Re-indexing {len(project_ctypes)} collection(s): {', '.join(project_ctypes)}")
+
+        store = MultiCollectionStore()
+        pipeline = IngestionPipeline()
+
+        # Keep collections not being re-indexed
+        surviving = [
+            c for c in (project.collections or [])
+            if not any(c == f"{project.slug}_{name}" for name in project_ctypes)
+        ]
+
+        for name, ctype in project_ctypes.items():
+            collection_name = f"{project.slug}_{name}"
+            store.drop_collection(collection_name)
+            count = pipeline._ingest_collection(
+                project.github_url, project.slug, collection_name, ctype
+            )
+            if count > 0:
+                surviving.append(collection_name)
+                print(f"  {collection_name}: {count} chunks")
+
+        self.registry.update_indexed_at(project.slug, surviving)
+        self.registry.update_status(project.slug, ProjectStatus.ACTIVE)
+        self._store_last_sha(project.slug, latest_sha)
+
+    def _get_changed_files(self, repo, old_sha: str, new_sha: str) -> list[str]:
+        if not old_sha:
+            return []  # first run — full ingestion handled by IngestionPipeline
+        try:
+            comparison = repo.compare(old_sha, new_sha)
+            return [f.filename for f in comparison.files]
+        except Exception:
+            return []
+
+    def _get_last_sha(self, slug: str) -> str:
+        project = self.registry.get(slug)
+        return project.last_commit_sha if project else ""
+
+    def _store_last_sha(self, slug: str, sha: str) -> None:
+        self.registry.update_commit_sha(slug, sha)

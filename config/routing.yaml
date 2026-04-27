@@ -1,0 +1,71 @@
+# Intent classification rules — ordered by priority (first match wins).
+# Used by QueryProcessor to route queries to the right agent.
+
+intent_patterns:
+  statistical:
+    priority: CRITICAL
+    description: Questions about numbers, trends, counts, history
+    patterns:
+      - "how many (commits|contributors|stars|forks|releases|files|lines)"
+      - "when was (the last|first) (commit|release|update)"
+      - "show (me )?(a )?(graph|chart|plot|trend)"
+      - "commit (history|frequency|cadence)"
+      - "release (cadence|frequency|history)"
+      - "most active (contributors?|committers?)"
+      - "lines of code"
+      - "growth (over time|trend)"
+
+  comparison:
+    priority: HIGH
+    description: Side-by-side comparison of two or more projects
+    patterns:
+      - "compare (.+) (and|vs|versus|to|with) (.+)"
+      - "difference between (.+) and (.+)"
+      - "which (project|one|repo) (is|has|does)"
+      - "better than|worse than|similar to"
+      - "pros and cons"
+
+  health:
+    priority: HIGH
+    description: Community activity, maintenance status, contributor health
+    patterns:
+      - "(is|how).*(actively|well) maintained"
+      - "actively maintained"
+      - "community health"
+      - "bus factor"
+      - "contributor diversity"
+      - "response time (for )?(issues?|prs?|pull requests?)"
+      - "last (active|activity|commit|update)"
+      - "abandoned|archived|dead"
+
+  code_search:
+    priority: NORMAL
+    description: Questions about code, methods, functions, APIs
+    patterns:
+      - "how (do I|to|can I) (use|call|implement|create|build)"
+      - "show (me )?(an? )?(example|sample|code)"
+      - "what does (method|function|class|module) .+ do"
+      - "how is .+ implemented"
+      - "source code for"
+      - "api (for|to)"
+
+  conceptual:
+    priority: NORMAL
+    description: Architecture, concepts, getting started, configuration
+    patterns:
+      - "what is"
+      - "how does .+ work"
+      - "explain"
+      - "getting started"
+      - "architecture"
+      - "design"
+      - "concepts?"
+      - "configuration"
+      - "install"
+      - "setup"
+      - "overview"
+
+  general:
+    priority: LOW
+    description: Fallback — standard RAG retrieval across all relevant collections
+    patterns: []
