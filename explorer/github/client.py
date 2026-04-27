@@ -24,6 +24,11 @@ class GitHubClient:
 
     def get_repo(self, github_url: str) -> Repository:
         slug = self._url_to_slug(github_url)
+        if "/" not in slug:
+            raise ValueError(
+                f"'{github_url}' looks like an organization or user URL, not a repository. "
+                f"Please provide a full repo URL, e.g. https://github.com/{slug}/{slug}"
+            )
         return self._gh.get_repo(slug)
 
     def download_zipball(self, repo: Repository, dest_dir: "Path") -> "Path":

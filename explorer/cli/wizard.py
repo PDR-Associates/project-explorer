@@ -30,7 +30,31 @@ class OnboardingWizard:
     def run(self, github_url: str, accept_all: bool = False) -> None:
         self.console.print(f"\n[bold]Analyzing[/bold] {github_url} ...")
 
-        plan = self.analyzer.analyze(github_url)
+        try:
+            plan = self.analyzer.analyze(github_url)
+        except ValueError as exc:
+            self.console.print(f"[red]Error:[/red] {exc}")
+            return
+        except Exception as exc:
+            # Strip the raw traceback for common API errors (404, rate limit, auth)
+            msg = str(exc)
+            if "404" in msg or "Not Found" in msg:
+                self.console.print(
+                    f"[red]Repository not found:[/red] {github_url}\n"
+                    "[dim]Check the URL is a public repo (not an org or private repo).[/dim]"
+                )
+            elif "401" in msg or "403" in msg:
+                self.console.print(
+                    "[red]Authentication error.[/red] Check GITHUB_TOKEN in .env has repo read scope."
+                )
+            elif "rate limit" in msg.lower():
+                self.console.print(
+                    "[red]GitHub API rate limit exceeded.[/red] Wait and retry, or use a token with higher limits."
+                )
+            else:
+                self.console.print(f"[red]Failed to analyze repository:[/red] {exc}")
+            return
+
         slug = self._url_to_slug(github_url)
 
         if self.registry.exists(slug):
