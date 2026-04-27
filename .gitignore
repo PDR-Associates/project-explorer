@@ -1,5 +1,7 @@
 .env
 *.key
+.idea/
+*.iml
 __pycache__/
 *.pyc
 *.pyo
