@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from explorer.github.client import GitHubClient
 from explorer.registry import ProjectRegistry
@@ -109,7 +109,14 @@ class StatsFetcher:
         for c in commits:
             commit = c.commit
             author = commit.author
-            committed_at = author.date.isoformat() if author and author.date else ""
+            if author and author.date:
+                d = author.date
+                # Normalize to timezone-naive UTC so all stored values are consistent
+                if d.tzinfo is not None:
+                    d = d.astimezone(timezone.utc).replace(tzinfo=None)
+                committed_at = d.isoformat()
+            else:
+                committed_at = ""
             if not committed_at:
                 continue  # skip commits with no date — they break date-based queries
             rows.append((

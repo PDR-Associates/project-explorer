@@ -139,11 +139,11 @@ def weekly_commits_plotly(project_slug: str) -> "plotly.graph_objects.Figure":
     except Exception:
         rows = []
 
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()  # naive UTC — matches stored committed_at format
     week_counts: defaultdict = defaultdict(int)
     for (ts,) in rows:
         try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(ts[:19])  # strip tz suffix
             weeks_ago = (now - dt).days // 7
             if 0 <= weeks_ago < 13:
                 week_counts[weeks_ago] += 1

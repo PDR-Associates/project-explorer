@@ -41,7 +41,7 @@ def query_project_stats(project_slug: str) -> str:
             (slug,),
         ).fetchone()
         # Derive live commit counts from project_commits for consistency with query_top_committers
-        now = datetime.now(timezone.utc)
+        now = datetime.utcnow()  # naive UTC — matches stored committed_at format
         cutoff_30 = (now - timedelta(days=30)).isoformat()
         cutoff_90 = (now - timedelta(days=90)).isoformat()
         live_30 = conn.execute(
@@ -148,7 +148,7 @@ def query_commit_activity(project_slug: str) -> str:
     week_counts: defaultdict = defaultdict(int)
     for (ts,) in rows:
         try:
-            dt = datetime.fromisoformat(ts.replace("Z", ""))
+            dt = datetime.fromisoformat(ts[:19])  # strip tz suffix — stored as naive UTC
             weeks_ago = (now - dt).days // 7
             if weeks_ago < 12:
                 week_counts[weeks_ago] += 1

@@ -104,8 +104,8 @@ class StatsAgent(BaseExplorerAgent):
             return f"{kb / 1024:.1f} MB" if kb >= 1024 else f"{kb} KB"
 
         # Prefer live counts from project_commits for consistency
-        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-        _now = _dt.now(_tz.utc)
+        from datetime import datetime as _dt, timedelta as _td
+        _now = _dt.utcnow()  # naive UTC — matches stored committed_at format
         _c30 = _c90 = 0
         try:
             _conn2 = sqlite3.connect(registry.db_path)
@@ -201,7 +201,7 @@ class StatsAgent(BaseExplorerAgent):
         for r in rows:
             ts = r.get("committed_at", "")
             try:
-                dt = datetime.fromisoformat(ts.replace("Z", ""))
+                dt = datetime.fromisoformat(ts[:19])  # strip tz suffix — stored as naive UTC
                 weeks_ago = (now - dt).days // 7
                 if weeks_ago < 12:
                     week_counts[weeks_ago] += 1
