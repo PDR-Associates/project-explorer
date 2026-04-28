@@ -65,8 +65,19 @@ class ConversationAgent(BaseExplorerAgent):
         return self._agent
 
     def handle(self, query: str, project_slug: str | None = None, **kwargs) -> str:
-        slug = project_slug or self.project_slug
-        prompt = f"Project: {slug}\n\nQuestion: {query}" if slug else query
+        slug = project_slug or self.project_slug or self._infer_project_slug(query)
+
+        lines: list[str] = []
+        if slug:
+            lines.append(f"Project: {slug}")
+            # Tell the agent which collection names exist so it can call vector_search correctly
+            from explorer.collection_router import CollectionRouter
+            collections = CollectionRouter().select(query, slug)
+            if collections:
+                lines.append(f"Available collections: {', '.join(collections)}")
+        lines.append(f"Question: {query}")
+        prompt = "\n".join(lines)
+
         try:
             return self._run_persistent(prompt)
         except Exception:
