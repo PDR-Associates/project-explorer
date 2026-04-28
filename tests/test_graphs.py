@@ -1,12 +1,20 @@
 """Tests for dashboard graph builders — graceful empty-data handling."""
 from __future__ import annotations
 
+import importlib.util
 import json
 import sqlite3
 
 import pytest
 
 from explorer.registry import Project, ProjectRegistry
+
+_plotly_available = pytest.mark.skipif(
+    importlib.util.find_spec("plotly") is None, reason="plotly not installed"
+)
+_plotext_available = pytest.mark.skipif(
+    importlib.util.find_spec("plotext") is None, reason="plotext not installed"
+)
 
 
 @pytest.fixture
@@ -29,7 +37,8 @@ def _insert_stats(db_path, fetched_at, stars, commits_30d=5, forks=10, lang_brea
     conn.close()
 
 
-class TestGraphsWithNoData:
+@_plotext_available
+class TestGraphsWithNoDataTerminal:
     def test_commits_terminal_no_data(self, registry, monkeypatch, capsys):
         from explorer.dashboard import graphs
         monkeypatch.setattr(graphs, "_load_history", lambda slug, limit=12: [])
@@ -44,6 +53,9 @@ class TestGraphsWithNoData:
         captured = capsys.readouterr()
         assert "No stats data" in captured.out
 
+
+@_plotly_available
+class TestGraphsWithNoData:
     def test_stars_plotly_returns_figure_with_empty_data(self, registry, monkeypatch):
         from explorer.dashboard import graphs
         monkeypatch.setattr(graphs, "_load_history", lambda slug, limit=12: [])
@@ -63,10 +75,10 @@ class TestGraphsWithNoData:
         from explorer.dashboard import graphs
         monkeypatch.setattr(graphs, "_latest_row", lambda slug: {})
         fig = graphs.health_radar_plotly("proj")
-        # Should not crash; returns a figure with a "No data" title
         assert "No data" in fig.layout.title.text
 
 
+@_plotly_available
 class TestGraphsWithData:
     def test_stars_plotly_populated(self, registry, monkeypatch):
         from explorer.dashboard import graphs

@@ -1,12 +1,17 @@
 """Tests for FastAPI web routes — projects, stats, query endpoints."""
 from __future__ import annotations
 
+import importlib.util
 import json
 import sqlite3
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+
+_pygithub_available = pytest.mark.skipif(
+    importlib.util.find_spec("github") is None, reason="PyGitHub not installed"
+)
 
 from explorer.registry import Project, ProjectRegistry
 
@@ -86,6 +91,7 @@ class TestProjectsRouter:
         resp = client.delete("/api/projects/ghost")
         assert resp.status_code == 404
 
+    @_pygithub_available
     def test_refresh_project_returns_started(self, client):
         with patch("explorer.ingestion.incremental.IncrementalIndexer") as mock_idx, \
              patch("explorer.query_cache.QueryCache") as mock_cache:

@@ -1,11 +1,16 @@
 """Tests for IncrementalIndexer — SHA comparison and changed-file routing."""
 from __future__ import annotations
 
+import importlib.util
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from explorer.registry import Project, ProjectRegistry, ProjectStatus
+
+_pygithub_available = pytest.mark.skipif(
+    importlib.util.find_spec("github") is None, reason="PyGitHub not installed"
+)
 
 
 @pytest.fixture
@@ -25,6 +30,7 @@ def project(registry):
     return p
 
 
+@_pygithub_available
 class TestIncrementalIndexer:
     def _make_indexer(self, registry):
         from explorer.ingestion.incremental import IncrementalIndexer
