@@ -67,19 +67,31 @@ class BaseExplorerAgent(ABC):
         return f"{backend}:{model}"
 
     def _infer_project_slug(self, query: str) -> str | None:
-        """Scan registered projects to find one whose slug or display name appears in the query."""
+        """
+        Scan registered projects to find one whose slug or display name appears in the query.
+        Uses whole-word matching and returns the longest match to resolve ambiguity
+        (e.g. 'egeria_workspaces' beats 'egeria' when the query mentions 'egeria-workspaces').
+        """
+        import re
         try:
             from explorer.registry import ProjectRegistry
             q = query.lower()
+            q_normalized = q.replace("-", "_")  # normalize hyphens so slug match works
+            best_slug: str | None = None
+            best_len = 0
             for project in ProjectRegistry().list_all():
-                if project.slug.lower() in q:
-                    return project.slug
-                words = project.display_name.lower().split()
-                if all(w in q for w in words):
-                    return project.slug
+                slug = project.slug.lower()
+                matched = bool(re.search(r"\b" + re.escape(slug) + r"\b", q_normalized))
+                if not matched and project.display_name:
+                    # Split on hyphens and spaces so "egeria-workspaces" → ["egeria","workspaces"]
+                    words = re.split(r"[-\s]+", project.display_name.lower())
+                    matched = bool(words and all(w in q for w in words))
+                if matched and len(slug) > best_len:
+                    best_slug = project.slug
+                    best_len = len(slug)
         except Exception:
             pass
-        return None
+        return best_slug
 
     def _clarification_response(self, query: str) -> str:
         """Return a natural-language question asking which project the user means."""

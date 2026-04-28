@@ -14,13 +14,14 @@ class DocAgent(BaseExplorerAgent):
         return [vector_search]
 
     def handle(self, query: str, project_slug: str | None = None, **kwargs) -> str:
+        slug = project_slug or self._infer_project_slug(query)
         from explorer.collection_router import CollectionRouter
-        collections = CollectionRouter().select(query, project_slug)
+        collections = CollectionRouter().select(query, slug)
         if not collections:
             return "No documentation collections are indexed for this project."
 
         context_lines = []
-        if project_slug:
+        if slug:
             context_lines.append(f"Project: {project_slug}")
         context_lines.append(f"Available collections: {', '.join(collections)}")
         context_lines.append(f"\nQuestion: {query}")
@@ -36,4 +37,4 @@ class DocAgent(BaseExplorerAgent):
             if not results:
                 return "I couldn't find relevant documentation for that query."
             context = "\n\n---\n\n".join(r.text for r in results)
-            return get_llm().complete(build_rag_prompt(query, context, project_slug))
+            return get_llm().complete(build_rag_prompt(query, context, slug))
