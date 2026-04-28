@@ -115,6 +115,19 @@ class ProjectRegistry:
             ]:
                 if col not in existing_stats:
                     conn.execute(f"ALTER TABLE project_stats ADD COLUMN {col} {defn}")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS project_commits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_slug TEXT NOT NULL,
+                    sha TEXT NOT NULL,
+                    message TEXT DEFAULT '',
+                    author_name TEXT DEFAULT '',
+                    author_email TEXT DEFAULT '',
+                    committed_at TEXT NOT NULL,
+                    UNIQUE(project_slug, sha),
+                    FOREIGN KEY (project_slug) REFERENCES projects(slug)
+                )
+            """)
 
     def add(self, project: Project) -> None:
         data = {**asdict(project), "collections": json.dumps(project.collections)}
@@ -174,6 +187,7 @@ class ProjectRegistry:
         with self._conn() as conn:
             conn.execute("DELETE FROM projects WHERE slug = ?", (normalized,))
             conn.execute("DELETE FROM project_stats WHERE project_slug = ?", (normalized,))
+            conn.execute("DELETE FROM project_commits WHERE project_slug = ?", (normalized,))
 
     def exists(self, slug: str) -> bool:
         return self.get(slug) is not None

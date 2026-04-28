@@ -19,3 +19,4 @@ htmlcov/
 mlruns/
 mlartifacts/
 .phoenix/
+!/CLAUDE.md

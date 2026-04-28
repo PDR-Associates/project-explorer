@@ -1,10 +1,13 @@
 """Fetches GitHub statistics and writes them to the SQLite project_stats time-series table."""
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta
 
 from explorer.github.client import GitHubClient
 from explorer.registry import ProjectRegistry
+
+_COMMIT_LOOKBACK_DAYS = 90
 
 # Rough bytes-per-line by language for LOC estimation
 _BYTES_PER_LINE: dict[str, int] = {
@@ -43,13 +46,15 @@ class StatsFetcher:
         if not project:
             raise ValueError(f"Project '{project_slug}' not found")
 
+        slug = project.slug  # always use normalized slug for DB writes
+
         repo = self.client.get_repo(project.github_url)
         now = datetime.utcnow()
 
         releases = list(repo.get_releases())
 
         stats = {
-            "project_slug": project_slug,
+            "project_slug": slug,
             "fetched_at": now.isoformat(),
             "stars": repo.stargazers_count,
             "forks": repo.forks_count,
@@ -89,7 +94,44 @@ class StatsFetcher:
         """, stats)
         conn.commit()
         conn.close()
+        try:
+            count = self._fetch_commits(slug, repo)
+            stats["commits_fetched"] = count
+        except Exception as exc:
+            stats["commits_fetch_error"] = str(exc)
         return stats
+
+    def _fetch_commits(self, project_slug: str, repo) -> int:
+        """Fetch recent commits and upsert into project_commits table. Returns row count inserted."""
+        since = datetime.utcnow() - timedelta(days=_COMMIT_LOOKBACK_DAYS)
+        commits = repo.get_commits(since=since)  # raises on API failure — caller handles
+        rows = []
+        for c in commits:
+            commit = c.commit
+            author = commit.author
+            committed_at = author.date.isoformat() if author and author.date else ""
+            if not committed_at:
+                continue  # skip commits with no date — they break date-based queries
+            rows.append((
+                project_slug,
+                c.sha,
+                (commit.message or "").split("\n")[0][:200],
+                author.name if author else "",
+                author.email if author else "",
+                committed_at,
+            ))
+        if not rows:
+            return 0
+        conn = sqlite3.connect(self.registry.db_path)
+        conn.executemany(
+            """INSERT OR IGNORE INTO project_commits
+               (project_slug, sha, message, author_name, author_email, committed_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        return len(rows)
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

@@ -13,6 +13,7 @@ class SearchResult:
     score: float
     metadata: dict
     collection: str
+    chunk_id: int = 0  # Milvus auto-id, used for feedback reranking
 
 
 class MultiCollectionStore:
@@ -77,6 +78,7 @@ class MultiCollectionStore:
         client = self._get_client()
         q_vec = embed_one(query)
         results: list[SearchResult] = []
+        boosts = self._load_boosts()
         for collection in collections:
             if not client.has_collection(collection):
                 continue
@@ -88,9 +90,13 @@ class MultiCollectionStore:
                 search_params={"metric_type": "COSINE"},
             )
             for hit in hits[0]:
-                score = hit.get("distance", 0.0)
-                if score < threshold:
+                base_score = hit.get("distance", 0.0)
+                if base_score < threshold:
                     continue
+                chunk_id = hit.get("id", 0)
+                ref = f"{collection}:{chunk_id}"
+                boost = boosts.get(ref, 0.0)
+                score = min(1.0, base_score + boost)
                 entity = hit.get("entity", {})
                 text = entity.get("text", "")
                 try:
@@ -98,9 +104,30 @@ class MultiCollectionStore:
                 except Exception:
                     metadata = {}
                 results.append(SearchResult(text=text, score=score,
-                                            metadata=metadata, collection=collection))
+                                            metadata=metadata, collection=collection,
+                                            chunk_id=chunk_id))
         results.sort(key=lambda r: r.score, reverse=True)
         return results[:k]
+
+    def _load_boosts(self) -> dict[str, float]:
+        """Load per-chunk feedback boosts from SQLite metrics DB."""
+        try:
+            import sqlite3
+            db_path = self._cfg.observability.metrics_db
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute(
+                "SELECT chunk_ref, positive_count, total_count FROM chunk_feedback"
+            ).fetchall()
+            conn.close()
+            boosts = {}
+            for ref, pos, total in rows:
+                if total > 0:
+                    precision = pos / total
+                    confidence = min(total / 5.0, 1.0)  # grows with 5+ votes
+                    boosts[ref] = (precision - 0.5) * confidence * 0.3
+            return boosts
+        except Exception:
+            return {}
 
     def insert(self, collection: str, texts: list[str], metadatas: list[dict]) -> int:
         from explorer.embeddings import embed_texts

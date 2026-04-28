@@ -66,6 +66,35 @@ class BaseExplorerAgent(ABC):
             model = cfg.ollama.model
         return f"{backend}:{model}"
 
+    def _infer_project_slug(self, query: str) -> str | None:
+        """Scan registered projects to find one whose slug or display name appears in the query."""
+        try:
+            from explorer.registry import ProjectRegistry
+            q = query.lower()
+            for project in ProjectRegistry().list_all():
+                if project.slug.lower() in q:
+                    return project.slug
+                words = project.display_name.lower().split()
+                if all(w in q for w in words):
+                    return project.slug
+        except Exception:
+            pass
+        return None
+
+    def _clarification_response(self, query: str) -> str:
+        """Return a natural-language question asking which project the user means."""
+        try:
+            from explorer.registry import ProjectRegistry
+            slugs = [p.slug for p in ProjectRegistry().list_all()]
+            available = ", ".join(slugs) if slugs else "none registered yet"
+        except Exception:
+            available = "unknown"
+        return (
+            f"Which project are you asking about? "
+            f"Available projects: {available}. "
+            f"Try rephrasing with the project name, e.g. 'How many stars does {available.split(',')[0].strip()} have?'"
+        )
+
     def _run_agent(self, prompt: str) -> str:
         """Run the BeeAI RequirementAgent synchronously, handling both sync and async callers."""
         async def _inner():

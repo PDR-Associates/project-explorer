@@ -106,6 +106,43 @@ async def languages_chart(slug: str) -> dict:
     return json.loads(fig.to_json())
 
 
+@router.get("/{slug}/charts/top_committers")
+async def top_committers_chart(slug: str) -> dict:
+    """Return Plotly figure JSON for the top-committers horizontal bar chart."""
+    from explorer.dashboard.graphs import top_committers_plotly
+    from fastapi import HTTPException
+    fig = top_committers_plotly(slug)
+    if fig is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No commit data for '{slug}' — run 'project-explorer refresh {slug}' first",
+        )
+    return json.loads(fig.to_json())
+
+
+@router.get("/{slug}/charts/weekly_commits")
+async def weekly_commits_chart(slug: str) -> dict:
+    """Return Plotly figure JSON for the weekly commit-activity bar chart."""
+    from explorer.dashboard.graphs import weekly_commits_plotly
+    fig = weekly_commits_plotly(slug)
+    return json.loads(fig.to_json())
+
+
+@router.get("/compare/charts/stats")
+async def compare_stats_chart(slugs: str) -> dict:
+    """Return Plotly grouped bar chart comparing stats across comma-separated project slugs.
+
+    Example: GET /api/stats/compare/charts/stats?slugs=proj_a,proj_b
+    """
+    from explorer.dashboard.graphs import compare_stats_plotly
+    slug_list = [s.strip() for s in slugs.split(",") if s.strip()]
+    if len(slug_list) < 2:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="Provide at least two comma-separated slugs")
+    fig = compare_stats_plotly(slug_list)
+    return json.loads(fig.to_json())
+
+
 @router.get("/{slug}/charts/health")
 async def health_chart(slug: str) -> dict:
     """Return Plotly figure JSON for the project-health radar chart."""

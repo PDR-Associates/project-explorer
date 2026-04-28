@@ -130,8 +130,16 @@ class OnboardingWizard:
         self.console.print("[dim]Fetching project statistics...[/dim]")
         try:
             from explorer.github.stats_fetcher import StatsFetcher
-            StatsFetcher().fetch(slug)
-            self.console.print("[dim]Stats fetched.[/dim]")
+            result = StatsFetcher().fetch(slug)
+            if "commits_fetch_error" in result:
+                self.console.print(
+                    f"[yellow]Warning:[/yellow] commit history could not be fetched: "
+                    f"{result['commits_fetch_error']}\n"
+                    f"[dim]Run 'project-explorer refresh {slug}' to retry.[/dim]"
+                )
+            else:
+                n = result.get("commits_fetched", 0)
+                self.console.print(f"[dim]Stats fetched ({n} commits stored).[/dim]")
         except Exception as exc:
             self.console.print(f"[dim]Stats fetch skipped: {exc}[/dim]")
 

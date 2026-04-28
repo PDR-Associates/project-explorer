@@ -34,7 +34,7 @@ class QueryProcessor:
 
     def classify(self, query: str) -> QueryIntent:
         q = query.lower()
-        priority_order = ["statistical", "comparison", "health", "code_search", "conceptual"]
+        priority_order = ["comparison", "statistical", "health", "code_search", "conceptual"]
         for intent_name in priority_order:
             rule = self._rules.get(intent_name, {})
             for pattern in rule.get("patterns", []):

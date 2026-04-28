@@ -47,11 +47,31 @@ class ProjectItem(ListItem):
 class ChatMessage(Static):
     """A single chat bubble — user or assistant."""
 
-    def __init__(self, role: str, text: str) -> None:
-        color = "cyan" if role == "You" else "green"
-        content = f"[bold {color}]{role}:[/bold {color}]\n{text}"
-        super().__init__(content)
+    def __init__(self, role: str, text: str = "") -> None:
+        self._role = role
+        self._color = "cyan" if role == "You" else "green"
+        super().__init__(self._render(text))
         self.add_class(f"msg-{role.lower()}")
+
+    def _render(self, text: str) -> str:
+        return f"[bold {self._color}]{self._role}:[/bold {self._color}]\n{text}"
+
+    def append_text(self, text: str) -> None:
+        """Append a chunk to the existing content (called from worker thread via call_from_thread)."""
+        current = self.renderable
+        # Strip the existing markup header to get raw text, then re-render with appended text
+        # Simpler: track raw text separately
+        if not hasattr(self, "_raw"):
+            self._raw = ""
+        self._raw += text
+        self.update(self._render(self._raw))
+
+    def set_text(self, text: str) -> None:
+        """Replace the full text content."""
+        if not hasattr(self, "_raw"):
+            self._raw = ""
+        self._raw = text
+        self.update(self._render(text))
 
 
 class ProjectExplorerApp(App):
@@ -142,13 +162,18 @@ class ProjectExplorerApp(App):
         Binding("r", "refresh_project", "Refresh", show=True),
     ]
 
+    _CLARIFICATION_PREFIX = "Which project are you asking about?"
+
     selected_project: reactive[str | None] = reactive(None)
     last_query_hash: reactive[str | None] = reactive(None)
     _awaiting_feedback: bool = False
+    _pending_clarification: dict | None = None  # {"query": str} when agent asked for project
+    _last_query: str = ""
 
-    def __init__(self, rag_system) -> None:
+    def __init__(self, conv_agent, rag_system) -> None:
         super().__init__()
-        self._rag = rag_system
+        self._conv = conv_agent   # ConversationAgent — persistent memory across turns
+        self._rag = rag_system    # RAGSystem — used for streaming output
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -190,7 +215,17 @@ class ProjectExplorerApp(App):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if isinstance(event.item, ProjectItem):
             self.selected_project = event.item.slug
+            self._conv.project_slug = event.item.slug  # keep ConversationAgent in sync
             self._set_status(f"Scoped to: {event.item.display_name}  [{event.item.slug}]")
+            if self._pending_clarification:
+                pending = self._pending_clarification
+                self._pending_clarification = None
+                self._append_message(
+                    "Assistant",
+                    f"Got it — scoping to **{event.item.slug}** and re-running your question…",
+                )
+                self._set_status("Thinking…")
+                self._run_query(pending["query"])
 
     # ── chat ──────────────────────────────────────────────────────────────────
 
@@ -201,20 +236,79 @@ class ProjectExplorerApp(App):
         event.input.value = ""
         self._append_message("You", query)
         self.last_query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+        self._last_query = query
+
+        # If awaiting clarification, treat typed input as a project name
+        if self._pending_clarification:
+            orig_query = self._pending_clarification["query"]
+            self._pending_clarification = None
+            slug = query.replace("project:", "").strip().replace(" ", "_").lower()
+            self.selected_project = slug
+            self._set_status(f"Scoped to: {slug} — re-running question…")
+            self._append_message("Assistant", f"Got it — scoping to **{slug}** and re-running your question…")
+            self._run_query(orig_query)
+            return
+
         self._set_status("Thinking…")
         self._run_query(query)
 
     @work(thread=True)
     def _run_query(self, query: str) -> None:
+        """
+        Two-phase query:
+          1. Stream general-RAG responses token-by-token into a live bubble.
+          2. For agent-routed queries (stats, health, etc.) the stream() method
+             returns one complete chunk — still goes through the same path.
+        Memory across turns is maintained by self._conv (ConversationAgent).
+        """
+        log = self.query_one("#chat-log")
+        bubble = ChatMessage("Assistant")
+        self.call_from_thread(log.mount, bubble)
+        self.call_from_thread(log.scroll_end, False)
+
+        accumulated = ""
         try:
-            response = self._rag.query(query, project_slug=self.selected_project)
+            for item in self._rag.stream(query, project_slug=self.selected_project):
+                if isinstance(item, dict) and item.get("_done"):
+                    break
+                chunk = str(item)
+                accumulated += chunk
+                self.call_from_thread(bubble.append_text, chunk)
+                self.call_from_thread(log.scroll_end, False)
         except Exception as exc:
-            response = f"Error: {exc}"
-        self.call_from_thread(self._on_response, response)
+            accumulated = f"Error: {exc}"
+            self.call_from_thread(bubble.set_text, accumulated)
+
+        # Feed the completed turn into ConversationAgent memory so subsequent
+        # turns have context even when streamed via the RAGSystem path.
+        try:
+            from beeai_framework.backend.message import UserMessage, AssistantMessage
+            import asyncio, concurrent.futures
+            async def _add_to_memory():
+                mem = self._conv._get_agent().memory
+                await mem.add(UserMessage(query))
+                await mem.add(AssistantMessage(accumulated))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                ex.submit(lambda: asyncio.run(_add_to_memory())).result(timeout=5)
+        except Exception:
+            pass  # memory update is best-effort
+
+        self.call_from_thread(self._on_stream_done, accumulated)
+
+    def _on_stream_done(self, response: str) -> None:
+        if response.startswith(self._CLARIFICATION_PREFIX):
+            self._pending_clarification = {"query": self._last_query}
+            self._set_status("Select a project from the sidebar (Tab) or type its name and press Enter")
+        else:
+            self._set_status("f=👍/👎 feedback  |  r=refresh project  |  Tab=switch pane")
 
     def _on_response(self, response: str) -> None:
         self._append_message("Assistant", response)
-        self._set_status("f=👍/👎 feedback  |  r=refresh project  |  Tab=switch pane")
+        if response.startswith(self._CLARIFICATION_PREFIX):
+            self._pending_clarification = {"query": self._last_query}
+            self._set_status("Select a project from the sidebar (Tab) or type its name and press Enter")
+        else:
+            self._set_status("f=👍/👎 feedback  |  r=refresh project  |  Tab=switch pane")
 
     def _append_message(self, role: str, text: str) -> None:
         log = self.query_one("#chat-log")
@@ -280,24 +374,29 @@ class ProjectExplorerApp(App):
 
 def run() -> None:
     """
-    Pre-warm the RAG system (loads embedding model + Milvus connection) in the
-    main thread before Textual starts. This prevents gRPC/PyTorch FD conflicts
-    that occur when those libraries initialise inside a worker thread.
+    Pre-warm the RAG system and ConversationAgent in the main thread before
+    Textual starts. This prevents gRPC/PyTorch FD conflicts that occur when
+    those libraries initialise inside a worker thread.
     """
     from explorer.rag_system import RAGSystem
     from explorer.embeddings import get_embedding_model
+    from explorer.agents.conversation_agent import ConversationAgent
 
     # Force model + Milvus client init now, in the main thread
     get_embedding_model()
     rag = RAGSystem()
-    # Touch the store to open the gRPC connection before Textual's event loop
     try:
         from explorer.multi_collection_store import MultiCollectionStore
         MultiCollectionStore()._get_client()
     except Exception:
         pass
 
-    ProjectExplorerApp(rag).run()
+    # Create the ConversationAgent with the pre-warmed RAGSystem as its fallback.
+    # _get_agent() is called lazily on first query so BeeAI init stays in the
+    # worker thread (avoids asyncio loop conflicts with Textual's event loop).
+    conv = ConversationAgent(rag_system=rag)
+
+    ProjectExplorerApp(conv, rag).run()
 
 
 if __name__ == "__main__":

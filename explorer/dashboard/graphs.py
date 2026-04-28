@@ -105,7 +105,7 @@ def stars_over_time_plotly(project_slug: str) -> "plotly.graph_objects.Figure":
 
 
 def commits_over_time_plotly(project_slug: str) -> "plotly.graph_objects.Figure":
-    """Return a Plotly figure for commit frequency over time."""
+    """Return a Plotly figure for commit frequency over time (snapshot history)."""
     import plotly.graph_objects as go
 
     rows = _load_history(project_slug)
@@ -117,6 +117,49 @@ def commits_over_time_plotly(project_slug: str) -> "plotly.graph_objects.Figure"
         title=f"Commit activity — {project_slug}",
         xaxis_title="Snapshot date",
         yaxis_title="Commits (30-day window)",
+    )
+    return fig
+
+
+def weekly_commits_plotly(project_slug: str) -> "plotly.graph_objects.Figure":
+    """Return a Plotly bar chart of weekly commit counts from project_commits table."""
+    import plotly.graph_objects as go
+    from collections import defaultdict
+    from datetime import datetime, timedelta, timezone
+
+    registry = ProjectRegistry()
+    try:
+        conn = sqlite3.connect(registry.db_path)
+        rows = conn.execute(
+            "SELECT committed_at FROM project_commits "
+            "WHERE project_slug = ? ORDER BY committed_at DESC",
+            (project_slug,),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        rows = []
+
+    now = datetime.now(timezone.utc)
+    week_counts: defaultdict = defaultdict(int)
+    for (ts,) in rows:
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            weeks_ago = (now - dt).days // 7
+            if 0 <= weeks_ago < 13:
+                week_counts[weeks_ago] += 1
+        except Exception:
+            pass
+
+    # Build x-axis oldest→newest so chart reads left-to-right
+    week_offsets = list(range(12, -1, -1))
+    dates = [(now - timedelta(weeks=w)).strftime("%Y-%m-%d") for w in week_offsets]
+    counts = [week_counts.get(w, 0) for w in week_offsets]
+
+    fig = go.Figure(go.Bar(x=dates, y=counts, name="Commits", marker_color="#06b6d4"))
+    fig.update_layout(
+        title=f"Weekly commit activity — {project_slug}",
+        xaxis_title="Week starting",
+        yaxis_title="Commits",
     )
     return fig
 
@@ -145,6 +188,91 @@ def language_breakdown_plotly(project_slug: str) -> "plotly.graph_objects.Figure
 
     fig = go.Figure(go.Pie(labels=labels, values=values))
     fig.update_layout(title=f"Language breakdown — {project_slug}")
+    return fig
+
+
+def top_committers_plotly(project_slug: str, limit: int = 10) -> "plotly.graph_objects.Figure | None":
+    """Return a Plotly horizontal bar chart of top committers, or None if no data."""
+    import plotly.graph_objects as go
+    from collections import Counter
+
+    registry = ProjectRegistry()
+    try:
+        conn = sqlite3.connect(registry.db_path)
+        rows = conn.execute(
+            "SELECT author_name, author_email FROM project_commits WHERE project_slug = ?",
+            (project_slug,),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        rows = []
+
+    if not rows:
+        return None
+
+    counter: Counter = Counter()
+    for name, email in rows:
+        label = name or email or "unknown"
+        counter[label] += 1
+
+    top = counter.most_common(limit)
+    # Reverse so highest bar is at the top of a horizontal chart
+    names = [t[0] for t in reversed(top)]
+    counts = [t[1] for t in reversed(top)]
+
+    fig = go.Figure(go.Bar(
+        x=counts, y=names, orientation="h",
+        marker_color="#10b981", text=counts, textposition="outside",
+    ))
+    fig.update_layout(
+        title=f"Top committers — {project_slug} (last 90 days)",
+        xaxis_title="Commits",
+        yaxis_title="",
+        height=max(220, len(top) * 32 + 80),
+        margin={"l": 160, "r": 40, "t": 40, "b": 40},
+    )
+    return fig
+
+
+def compare_stats_plotly(project_slugs: list[str]) -> "plotly.graph_objects.Figure":
+    """Return a grouped bar chart comparing key stats across multiple projects."""
+    import plotly.graph_objects as go
+
+    metrics = ["stars", "forks", "contributors_count", "commits_30d", "open_issues"]
+    labels = ["Stars", "Forks", "Contributors", "Commits (30d)", "Open Issues"]
+    colors = ["#06b6d4", "#10b981", "#f59e0b", "#8b5cf6", "#ef4444"]
+
+    project_data: dict[str, dict] = {}
+    registry = ProjectRegistry()
+    try:
+        conn = sqlite3.connect(registry.db_path)
+        conn.row_factory = sqlite3.Row
+        for slug in project_slugs:
+            row = conn.execute(
+                "SELECT * FROM project_stats WHERE project_slug = ? ORDER BY fetched_at DESC LIMIT 1",
+                (slug,),
+            ).fetchone()
+            project_data[slug] = dict(row) if row else {}
+        conn.close()
+    except Exception:
+        pass
+
+    fig = go.Figure()
+    for i, (metric, label, color) in enumerate(zip(metrics, labels, colors)):
+        values = [project_data.get(slug, {}).get(metric) or 0 for slug in project_slugs]
+        fig.add_trace(go.Bar(
+            name=label,
+            x=project_slugs,
+            y=values,
+            marker_color=color,
+        ))
+
+    fig.update_layout(
+        barmode="group",
+        title=f"Project comparison — {' vs '.join(project_slugs)}",
+        xaxis_title="Project",
+        yaxis_title="Count",
+    )
     return fig
 
 

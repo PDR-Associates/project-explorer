@@ -14,16 +14,17 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 | Component | Package | Notes |
 |---|---|---|
-| Agent framework | `beeai-framework[rag]` | `RequirementAgent` pattern |
-| Agent runtime | `agentstack-sdk` | Runtime + UI platform |
-| Vector store | `langchain-milvus` + `pymilvus` | Multi-tenant via collection namespacing |
+| Agent framework | `beeai-framework[rag]` | `RequirementAgent` with `@tool`-decorated functions |
+| Agent runtime | `agentstack-sdk` | A2A server, one `Server` instance per agent |
+| Vector store | `pymilvus` | Multi-tenant via collection namespacing |
 | Document parsing | `docling` | PDF, web, DOCX, Markdown |
 | Embeddings | `sentence-transformers` | `all-MiniLM-L6-v2`, 384-dim, MPS on Apple Silicon |
 | LLM default | `ollama` | Metal GPU on Apple Silicon; pluggable |
 | LLM tracing | `openinference-instrumentation-beeai` | → Arize Phoenix at localhost:6006 |
 | Experiment tracking | `mlflow` | Background thread, non-blocking |
 | CLI | `typer` + `rich` | |
-| Web UI | `fastapi` + `uvicorn` | |
+| Web UI | `fastapi` + `uvicorn` + Tailwind + Plotly.js | Single-page HTML frontend |
+| TUI | `textual` | Full-screen terminal UI |
 
 ## Setup
 
@@ -54,8 +55,9 @@ External services required:
 # Add a GitHub project (triggers onboarding wizard)
 project-explorer add https://github.com/owner/repo
 
-# List registered projects
+# List registered projects (shows collections and vector counts)
 project-explorer list
+project-explorer list --details   # full per-collection breakdown
 
 # Ask a question (one-shot)
 project-explorer ask "How does authentication work in project X?"
@@ -69,14 +71,28 @@ project-explorer chat
 # Interactive session scoped to a project
 project-explorer chat --project myproject
 
-# Refresh a project's index (incremental)
+# Refresh a project's index (incremental) and update GitHub stats/commits
 project-explorer refresh myproject
+project-explorer refresh myproject --no-stats   # skip GitHub API calls
 
 # Show environment health
 project-explorer status
 
 # Remove a project (drops all collections)
 project-explorer remove myproject
+
+# Launch full-screen TUI
+project-explorer tui
+
+# Launch browser-based web UI (Plotly charts + markdown rendering)
+project-explorer web
+project-explorer web --host 0.0.0.0 --port 8080 --reload
+
+# Start AgentStack A2A orchestrator (port 8080)
+project-explorer serve
+
+# Start all 6 specialist agents on consecutive ports (8080–8085)
+project-explorer serve --all
 
 # Terminal dashboard
 python -m explorer.dashboard.terminal_dashboard
@@ -102,15 +118,56 @@ User Query
   → Async: MLflow + Phoenix tracing, metrics write, cache store
 ```
 
-### Agent Pattern (BeeAI RequirementAgent)
+### Agent Pattern (BeeAI RequirementAgent + @tool)
 
 All agents follow the pattern validated in lfai/ML_LLM_Ops:
 - `RequirementAgent` with `max_iterations=20`, `total_max_retries=10`
-- Tools (e.g. `VectorStoreSearchTool`) registered at init
-- Streaming via `context.yield_async()`
+- Tools defined as `@tool`-decorated functions in `explorer/agents/tools.py`
+- BeeAI uses the function docstring as description and the signature to generate a Pydantic schema
 - Middleware captures request/response/error per tool call → Phoenix
 
+Four shared tools in `agents/tools.py`:
+- `vector_search(query, collection_names)` — used by Code, Doc, Compare agents
+- `query_project_stats(project_slug)` — used by Stats, Health, Compare agents
+- `query_top_committers(project_slug, limit)` — used by Stats, Health agents
+- `query_commit_activity(project_slug)` — used by Stats agent
+
+`BaseExplorerAgent` also provides:
+- `_infer_project_slug(query)` — infers project from query text against registry
+- `_clarification_response(query)` — returns a natural-language question listing available projects
+
 See `explorer/agents/base.py` for the shared base class.
+
+### A2A Endpoints (AgentStack)
+
+`agentstack_server.py` exposes six independently discoverable agents:
+
+| Port offset | Agent | Notes |
+|---|---|---|
+| +0 | Orchestrator | Routes by intent; general RAG fallback |
+| +1 | Statistics | `input_required` if no project inferred |
+| +2 | Code Search | |
+| +3 | Documentation | |
+| +4 | Health | `input_required` if no project inferred |
+| +5 | Compare | |
+
+Stats and Health use async generators with `yield TaskStatus(state=TaskState.input_required)` to pause and ask for a project name, then resume when the user replies.
+
+### Web UI
+
+`web/static/index.html` is a single-page app served by FastAPI:
+- Tailwind CSS (CDN), marked.js (CDN), Plotly.js (CDN)
+- Left sidebar: project list with status badges; click to scope queries
+- Chat area: markdown-rendered responses, 👍/👎 feedback on each message
+- Charts: Stars, Commits, Languages, Health — fetched as Plotly JSON from `/api/stats/{slug}/charts/{type}`
+- Clarification flow: detects "Which project are you asking about?" prefix; sidebar click or typed name re-runs original query
+
+### TUI (Textual)
+
+`tui/app.py` full-screen Textual app with clarification handling:
+- `_pending_clarification` state set when agent returns clarification response
+- Sidebar project selection auto-re-runs the pending query
+- Typed input treated as a project slug when clarification is pending
 
 ### Collection Naming
 
@@ -139,57 +196,43 @@ Not every project gets every collection — `RepoAnalyzer` inspects the repo and
 4. Observability (MLflow, Phoenix) runs in background threads — never block the response
 5. Incremental indexing is not optional for live repos — commit-diff based
 6. Chunk size is content-specific — code ≠ prose ≠ examples
+7. `refresh` always updates stats and commit history unless `--no-stats` — agents need SQLite data to answer contributor/trend queries
+8. Use single-quoted YAML strings for regex patterns containing backslashes (`\w`, `\d`, etc.) — YAML double-quote mode treats `\` as escape and `\w` is invalid
+9. A2A `Server` supports exactly one agent per instance — run one server per agent, gather with `asyncio.gather()`
+
 
 ## Module Map
 
 ```
 explorer/
 ├── config.py              # Pydantic settings (ExplorerConfig)
-├── registry.py            # Project Registry (SQLite CRUD)
+├── registry.py            # Project Registry (SQLite: projects, project_stats, project_commits)
 ├── rag_system.py          # Main orchestrator — entry point for all queries
 ├── query_processor.py     # Intent classifier + agent router
 ├── collection_router.py   # Selects relevant collections per query
 ├── query_cache.py         # LRU cache with optional Redis backend
 ├── llm_client.py          # LLMBackend protocol + Ollama/OpenAI/Anthropic impls
 ├── embeddings.py          # SentenceTransformer wrapper (MPS-aware)
-├── multi_collection_store.py  # Milvus multi-tenant operations
+├── multi_collection_store.py  # Milvus multi-tenant operations + feedback reranking
 ├── prompt_templates.py    # Per-agent prompt templates
+├── agentstack_server.py   # AgentStack A2A server (6 agents on ports 8080-8085)
 ├── github/
-│   ├── client.py          # PyGitHub + GraphQL wrapper (rate-limit aware)
-│   ├── analyzer.py        # RepoAnalyzer — detects content types, proposes collections
-│   └── stats_fetcher.py   # Fetches GitHub stats → SQLite time-series
 ├── ingestion/
-│   ├── pipeline.py        # Orchestrates full ingestion for a project
-│   ├── incremental.py     # Commit-diff / hash-based update detection
-│   ├── code_parser.py     # Python/JS/Java/Go/Rust parsers
-│   ├── doc_parser.py      # Markdown + Docling (PDF, web, DOCX)
-│   ├── notebook_parser.py # Jupyter .ipynb via nbconvert
-│   ├── api_parser.py      # OpenAPI/Swagger structured parsing
-│   └── data_prep.py       # Quality filtering, dedup, PII detection
 ├── agents/
-│   ├── base.py            # BaseExplorerAgent (RequirementAgent wrapper)
-│   ├── code_agent.py      # Code search, method lookup
-│   ├── doc_agent.py       # Conceptual Q&A from docs
-│   ├── stats_agent.py     # GitHub stats + Plotext/Plotly charts
-│   ├── compare_agent.py   # Multi-project side-by-side comparison
-│   ├── health_agent.py    # Community health scoring
+│   ├── base.py            # BaseExplorerAgent (_infer_project_slug, _clarification_response)
+│   ├── tools.py           # BeeAI @tool functions (vector_search, query_project_stats, ...)
+│   ├── stats_agent.py     # GitHub stats + commit trends (uses stats tools)
 │   └── conversation_agent.py  # Multi-turn BeeAI session wrapper
 ├── cli/
-│   ├── main.py            # Typer app — all CLI entry points
-│   ├── interactive.py     # REPL loop
-│   ├��─ wizard.py          # Onboarding wizard (add project flow)
-│   └── formatters.py      # Rich output helpers
+│   └── main.py            # Typer app (add, list, ask, chat, refresh, web, serve, tui, ...)
 ├── web/
 │   ├── app.py             # FastAPI application
-│   └── routes/            # query.py, projects.py, stats.py
+│   ├── static/index.html  # Single-page UI (Tailwind, Plotly.js, marked.js)
+│   └── routes/            # query.py (feedback endpoint), projects.py, stats.py
+├── tui/
+│   └── app.py             # Textual full-screen TUI (clarification-aware)
 ├── dashboard/
-│   ├── terminal_dashboard.py  # Rich Live dashboard
-│   └── graphs.py          # Plotext (terminal) + Plotly (web) graph builders
 └── observability/
-    ├── metrics_collector.py   # SQLite query metrics
-    ├── phoenix_client.py      # Arize Phoenix / OpenTelemetry wrapper
-    ├── mlflow_tracking.py     # Non-blocking MLflow experiment logging
-    └── feedback_collector.py  # User feedback (thumbs up/down)
 ```
 
 ## Testing

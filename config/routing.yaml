@@ -6,14 +6,23 @@ intent_patterns:
     priority: CRITICAL
     description: Questions about numbers, trends, counts, history
     patterns:
-      - "how many (commits|contributors|stars|forks|releases|files|lines)"
+      - "how many (commits|contributors|committers|stars|forks|releases|files|lines)"
       - "when was (the last|first) (commit|release|update)"
       - "show (me )?(a )?(graph|chart|plot|trend)"
-      - "commit (history|frequency|cadence)"
+      - "commit (history|frequency|cadence|activity|trend)"
       - "release (cadence|frequency|history)"
       - "most active (contributors?|committers?)"
+      - '(top|main|primary|key) (contribut\w+|committ?\w+)'
+      - 'who (are the |have been )?(contribut\w+|committ?\w+)'
+      - "who (contributed|committed|commited|works on|is working on)"
+      - '(list|show) (the )?(contribut\w+|committ?\w+)'
+      - 'contribut\w+ (to|for|of)'
+      - 'committ?\w+ (to|for|of)'
       - "lines of code"
       - "growth (over time|trend)"
+      - "(stars|forks|watchers|issues|releases|contributors|committers)"
+      - "activity (over|in|last|this)"
+      - "weekly|monthly (commits|activity|contributions)"
 
   comparison:
     priority: HIGH
@@ -21,9 +30,15 @@ intent_patterns:
     patterns:
       - "compare (.+) (and|vs|versus|to|with) (.+)"
       - "difference between (.+) and (.+)"
-      - "which (project|one|repo) (is|has|does)"
+      - "which (project|one|repo) (is|has|does|has more|is more)"
       - "better than|worse than|similar to"
       - "pros and cons"
+      - "(more|fewer|less) (stars|forks|commits|contributors|issues|releases) than"
+      - "which (has|have|is|are) (more|fewer|less|better|worse|faster|slower)"
+      - "statistical(ly)? compar"
+      - '(side.by.side|head.to.head)'
+      - '\bversus\b'
+      - 'vs\.?\s+\w'
 
   health:
     priority: HIGH

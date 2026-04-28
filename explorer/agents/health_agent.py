@@ -10,54 +10,56 @@ from explorer.registry import ProjectRegistry
 
 class HealthAgent(BaseExplorerAgent):
     """
-    Answers questions about project health using GitHub API data:
-    - Commit frequency (last 30/90 days)
-    - Issue response time and open/close ratio
-    - PR merge rate and cycle time
-    - Contributor diversity and bus factor estimate
-    - Release cadence
-
-    Does NOT use the vector store.
+    Answers questions about project health using GitHub API data.
+    Uses query_project_stats tool so the LLM can retrieve the metrics it needs.
     """
 
     def system_prompt(self) -> str:
         return health_agent_system_prompt()
 
     def tools(self) -> list:
-        return []
+        from explorer.agents.tools import query_project_stats, query_top_committers
+        return [query_project_stats, query_top_committers]
 
     def handle(self, query: str, project_slug: str | None = None, **kwargs) -> str:
-        health_data = self._fetch_health(project_slug)
-        if not health_data:
-            return "No health data available. Run 'project-explorer refresh' to fetch project stats."
-        from explorer.llm_client import get_llm
-        prompt = f"{self.system_prompt()}\n\nHealth data:\n{health_data}\n\nQuestion: {query}\n\nAssessment:"
-        return get_llm().complete(prompt)
+        slug = project_slug or self._infer_project_slug(query)
+
+        if not slug:
+            return self._clarification_response(query)
+
+        prompt = f"Project: {slug}\n\nQuestion: {query}"
+        try:
+            return self._run_agent(prompt)
+        except Exception:
+            health_data = self._fetch_health(slug)
+            if not health_data:
+                return (
+                    f"No health data available for '{slug}'. "
+                    f"Run: project-explorer refresh {slug}"
+                )
+            from explorer.llm_client import get_llm
+            fallback_prompt = (
+                f"{self.system_prompt()}\n\nHealth data:\n{health_data}\n\nQuestion: {query}\n\nAssessment:"
+            )
+            return get_llm().complete(fallback_prompt)
+
+    # ── fallback ───────────────────────────────────────────────────────────────
 
     def _fetch_health(self, project_slug: str | None) -> str:
         if not project_slug:
             return ""
-
         registry = ProjectRegistry()
         project = registry.get(project_slug)
         if not project:
             return ""
-
-        # Base stats from SQLite
         base = self._sqlite_stats(registry.db_path, project_slug)
         if not base:
             return ""
-
         sections = self._format_health_sections(project_slug, base)
-
-        # Augment with live GitHub signals not stored in SQLite
         github_extra = self._github_health(project)
         if github_extra:
             sections.extend(["", "Pull Requests (live):"] + github_extra)
-
         return "\n".join(sections)
-
-    # ── helpers ───────────────────────────────────────────────────────────────
 
     def _sqlite_stats(self, db_path: str, project_slug: str) -> dict:
         try:
@@ -96,9 +98,7 @@ class HealthAgent(BaseExplorerAgent):
         else:
             bus_factor = "High risk (single maintainer)"
 
-        release_cadence = "Unknown"
-        if releases and commits_90d:
-            release_cadence = f"{releases} total release(s)"
+        release_cadence = f"{releases} total release(s)" if releases and commits_90d else "Unknown"
 
         return [
             f"Project: {project_slug}",
@@ -125,7 +125,6 @@ class HealthAgent(BaseExplorerAgent):
         ]
 
     def _github_health(self, project) -> list[str]:
-        """Fetch PR counts from live GitHub API (not stored in SQLite)."""
         try:
             from explorer.github.client import GitHubClient
             client = GitHubClient()

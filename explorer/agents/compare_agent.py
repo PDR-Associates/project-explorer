@@ -7,49 +7,125 @@ from explorer.prompt_templates import compare_agent_system_prompt
 
 class CompareAgent(BaseExplorerAgent):
     """
-    Extracts project names from the query, retrieves context from each project's
-    collections, then asks the LLM to produce a structured comparison.
+    Uses all four shared tools so the LLM can independently retrieve content
+    and statistics for each project being compared.
+
+    Handles two comparison modes:
+      - Statistical: stars, commits, contributors, releases — uses query_project_stats,
+        query_top_committers, query_commit_activity
+      - Content/architecture: documentation and code differences — uses vector_search
     """
 
     def system_prompt(self) -> str:
         return compare_agent_system_prompt()
 
     def tools(self) -> list:
-        return []
+        from explorer.agents.tools import (
+            vector_search,
+            query_project_stats,
+            query_top_committers,
+            query_commit_activity,
+        )
+        return [vector_search, query_project_stats, query_top_committers, query_commit_activity]
 
     def handle(self, query: str, project_slug: str | None = None, **kwargs) -> str:
         slugs = self._extract_project_slugs(query)
-        if not slugs:
-            return "Please name the projects you'd like to compare (e.g. 'compare project-a and project-b')."
 
-        from explorer.multi_collection_store import MultiCollectionStore
+        if len(slugs) < 2:
+            from explorer.registry import ProjectRegistry
+            available = ", ".join(p.slug for p in ProjectRegistry().list_all())
+            return (
+                "Please name at least two projects to compare "
+                f"(e.g. 'compare project-a and project-b'). "
+                f"Available: {available or 'none indexed yet'}."
+            )
+
+        from explorer.registry import ProjectRegistry
+        all_projects = {p.slug: p for p in ProjectRegistry().list_all()}
+
+        project_info = []
+        for slug in slugs:
+            project = all_projects.get(slug)
+            if project and project.collections:
+                cols = ", ".join(sorted(project.collections))
+                project_info.append(f"  {slug}: {cols}")
+            else:
+                project_info.append(f"  {slug}: (no collections indexed — stats only)")
+
+        # Tell the agent which mode to use based on query keywords
+        q = query.lower()
+        is_stat_comparison = any(w in q for w in (
+            "star", "fork", "commit", "contributor", "release", "issue",
+            "active", "popular", "growth", "download", "trend", "statistics",
+            "stats", "number", "count", "how many",
+        ))
+
+        guidance = (
+            "This is primarily a STATISTICAL comparison. Call query_project_stats for each "
+            "project first, then query_top_committers and query_commit_activity if the user "
+            "asks about contributors or activity trends. Do NOT call vector_search unless "
+            "the user also asks about architecture or code."
+            if is_stat_comparison else
+            "This is primarily a CONTENT comparison. Call vector_search for each project "
+            "to retrieve relevant documentation or code, then call query_project_stats for "
+            "a brief stats snapshot to provide context."
+        )
+
+        prompt = (
+            f"Compare these projects: {', '.join(slugs)}\n\n"
+            f"Available collections per project:\n" + "\n".join(project_info) + "\n\n"
+            f"Comparison guidance: {guidance}\n\n"
+            f"Question: {query}\n\n"
+            "Structure your response with:\n"
+            "1. A summary table of key differences\n"
+            "2. A section per comparison dimension (stats, architecture, use cases, etc.)\n"
+            "3. A final recommendation or verdict if the user asked for one"
+        )
+
+        try:
+            return self._run_agent(prompt)
+        except Exception:
+            return self._fallback(query, slugs)
+
+    def _fallback(self, query: str, slugs: list[str]) -> str:
+        """Direct tool-call fallback when BeeAI is unavailable."""
+        from explorer.agents.tools import query_project_stats, vector_search
         from explorer.collection_router import CollectionRouter
         from explorer.llm_client import get_llm
 
-        store = MultiCollectionStore()
+        sections: list[str] = []
         router = CollectionRouter()
-        sections = []
-        for slug in slugs:
-            collections = router.select(query, slug)
-            results = store.search(query, collections, top_k=5)
-            context = "\n".join(r.text for r in results)
-            sections.append(f"## {slug}\n{context}")
 
-        combined = "\n\n".join(sections)
-        prompt = f"{self.system_prompt()}\n\nContext:\n{combined}\n\nQuestion: {query}\n\nComparison:"
-        return get_llm().complete(prompt)
+        for slug in slugs:
+            stat_text = query_project_stats(slug)
+            collections = router.select(query, slug)
+            if collections:
+                doc_text = vector_search(query, ",".join(collections))
+            else:
+                doc_text = "(no indexed content)"
+            sections.append(f"## {slug}\n\n### Stats\n{stat_text}\n\n### Content\n{doc_text}")
+
+        combined = "\n\n---\n\n".join(sections)
+        fallback_prompt = (
+            f"{self.system_prompt()}\n\n"
+            f"Data for projects being compared:\n\n{combined}\n\n"
+            f"Question: {query}\n\nComparison:"
+        )
+        return get_llm().complete(fallback_prompt)
 
     def _extract_project_slugs(self, query: str) -> list[str]:
         import re
         from explorer.registry import ProjectRegistry
+
         known = {p.slug: p for p in ProjectRegistry().list_all()}
         query_lower = query.lower()
-        found = []
+        found: list[str] = []
+
         for slug, project in known.items():
-            # Match slug (underscores or hyphens) or display name as whole word
-            slug_pattern = slug.replace("_", "[-_ ]")
+            slug_pattern = slug.replace("_", r"[-_ ]")
             display = re.escape(project.display_name.lower())
             if re.search(rf"\b{slug_pattern}\b", query_lower) or \
                re.search(rf"\b{display}\b", query_lower):
                 found.append(slug)
+
         return found

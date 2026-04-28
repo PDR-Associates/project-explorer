@@ -161,8 +161,11 @@ def _ingest_web_docs(project, docs_url: str, registry) -> None:
 
 
 @app.command()
-def refresh(slug: str = typer.Argument(help="Project slug to re-index")):
-    """Incrementally re-index a project (only changed files since last run)."""
+def refresh(
+    slug: str = typer.Argument(help="Project slug to re-index"),
+    no_stats: bool = typer.Option(False, "--no-stats", help="Skip GitHub statistics update"),
+):
+    """Incrementally re-index a project and refresh GitHub statistics."""
     from explorer.ingestion.incremental import IncrementalIndexer
     from explorer.query_cache import QueryCache
     from explorer.registry import ProjectRegistry
@@ -175,6 +178,21 @@ def refresh(slug: str = typer.Argument(help="Project slug to re-index")):
     dropped = QueryCache().invalidate_project(slug)
     if dropped:
         console.print(f"[dim]Cleared {dropped} cached query result(s) for '{slug}'.[/dim]")
+    if not no_stats:
+        console.print("[dim]Refreshing project statistics...[/dim]")
+        try:
+            from explorer.github.stats_fetcher import StatsFetcher
+            result = StatsFetcher().fetch(slug)
+            if "commits_fetch_error" in result:
+                console.print(
+                    f"[yellow]Warning:[/yellow] commit history could not be fetched: "
+                    f"{result['commits_fetch_error']}"
+                )
+            else:
+                n = result.get("commits_fetched", 0)
+                console.print(f"[dim]Stats updated ({n} commits stored).[/dim]")
+        except Exception as exc:
+            console.print(f"[dim]Stats update skipped: {exc}[/dim]")
 
 
 @app.command()
@@ -192,14 +210,41 @@ def tui():
 
 
 @app.command()
+def web(
+    host: str = typer.Option("127.0.0.1", help="Bind host"),
+    port: int = typer.Option(8000, help="Bind port"),
+    reload: bool = typer.Option(False, "--reload", help="Auto-reload on code changes (dev mode)"),
+):
+    """Start the web UI (FastAPI + HTML frontend with Plotly charts and markdown)."""
+    import uvicorn
+    console.print(f"[cyan]Starting web UI at http://{host}:{port}[/cyan]")
+    uvicorn.run("explorer.web.app:app", host=host, port=port, reload=reload)
+
+
+@app.command()
 def serve(
     host: str = typer.Option("0.0.0.0", help="Bind host"),
-    port: int = typer.Option(8080, help="Bind port"),
+    port: int = typer.Option(8100, help="Base port"),
+    all_agents: bool = typer.Option(False, "--all", help="Start all 6 specialist agents on consecutive ports"),
 ):
-    """Start the AgentStack A2A server (exposes agents to beeai.dev platform)."""
+    """Start the AgentStack A2A server (exposes agents to beeai.dev platform).
+
+    Without --all: orchestrator only on PORT (routes by intent, general RAG fallback).
+
+    With --all: starts all 6 agents on consecutive ports:
+      PORT+0  orchestrator
+      PORT+1  statistics
+      PORT+2  code search
+      PORT+3  documentation
+      PORT+4  health
+      PORT+5  compare
+    """
     from explorer.agentstack_server import run as agentstack_run
-    console.print(f"[cyan]Starting AgentStack server on {host}:{port}[/cyan]")
-    agentstack_run(host=host, port=port)
+    if all_agents:
+        console.print(f"[cyan]Starting all Project Explorer agents (base port {port})...[/cyan]")
+    else:
+        console.print(f"[cyan]Starting Project Explorer orchestrator on {host}:{port}[/cyan]")
+    agentstack_run(host=host, port=port, all_agents=all_agents)
 
 
 if __name__ == "__main__":

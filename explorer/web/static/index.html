@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Project Explorer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js" charset="utf-8"></script>
+  <script>
+    tailwind.config = { darkMode: 'class' };
+  </script>
+  <style>
+    body { font-family: 'Inter', system-ui, sans-serif; }
+    #messages { scroll-behavior: smooth; }
+    .msg-you { border-left: 3px solid #06b6d4; }
+    .msg-assistant { border-left: 3px solid #10b981; }
+    .msg-assistant.clarify { border-left: 3px solid #f59e0b; }
+    .prose pre { background: #1e293b; padding: .75rem; border-radius: .375rem; overflow-x: auto; }
+    .prose code { background: #1e293b; padding: .1em .3em; border-radius: .2em; font-size: .85em; }
+    .prose p { margin-bottom: .5rem; }
+    .prose ul, .prose ol { margin-left: 1.25rem; margin-bottom: .5rem; }
+    .prose li { margin-bottom: .15rem; }
+    .prose h1,.prose h2,.prose h3 { font-weight: 600; margin: .75rem 0 .4rem; }
+    .prose table { border-collapse: collapse; width: 100%; margin-bottom: .5rem; }
+    .prose th, .prose td { border: 1px solid #334155; padding: .3rem .6rem; text-align: left; }
+    .prose th { background: #1e293b; }
+    .chart-box { height: 220px; margin-bottom: .5rem; }
+    .project-btn.selected { background: #0e7490 !important; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  </style>
+</head>
+<body class="dark bg-slate-900 text-slate-100 h-screen flex flex-col overflow-hidden">
+
+<!-- Header -->
+<header class="flex items-center justify-between px-4 py-2 bg-slate-800 border-b border-slate-700 shrink-0">
+  <div class="flex items-center gap-3">
+    <span class="text-cyan-400 font-bold text-lg">⬡ Project Explorer</span>
+    <span id="scope-badge" class="hidden text-xs bg-cyan-900 text-cyan-300 px-2 py-0.5 rounded-full"></span>
+  </div>
+  <span class="text-xs text-slate-500">Multi-agent RAG · <a href="/docs" target="_blank" class="text-cyan-600 hover:underline">API docs</a></span>
+</header>
+
+<!-- Main layout -->
+<div class="flex flex-1 overflow-hidden">
+
+  <!-- Sidebar -->
+  <aside class="w-64 shrink-0 flex flex-col bg-slate-800 border-r border-slate-700 overflow-y-auto">
+    <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">Projects</div>
+
+    <div class="px-2 pb-1">
+      <button onclick="selectProject(null)"
+        class="project-btn w-full text-left px-3 py-1.5 rounded text-sm text-slate-300 hover:bg-slate-700 transition-colors"
+        data-slug="">
+        All projects
+      </button>
+    </div>
+
+    <div id="project-list" class="px-2 flex flex-col gap-0.5"></div>
+
+    <!-- Charts section -->
+    <div id="charts-section" class="hidden px-3 pt-3 pb-2 border-t border-slate-700 mt-2">
+      <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Charts</div>
+      <div class="flex gap-1 flex-wrap mb-2">
+        <button onclick="showChart('stars')"   class="chart-tab text-xs px-2 py-0.5 rounded bg-slate-700 hover:bg-cyan-800 text-slate-300">Stars</button>
+        <button onclick="showChart('commits')" class="chart-tab text-xs px-2 py-0.5 rounded bg-slate-700 hover:bg-cyan-800 text-slate-300">Commits</button>
+        <button onclick="showChart('languages')" class="chart-tab text-xs px-2 py-0.5 rounded bg-slate-700 hover:bg-cyan-800 text-slate-300">Languages</button>
+        <button onclick="showChart('health')"  class="chart-tab text-xs px-2 py-0.5 rounded bg-slate-700 hover:bg-cyan-800 text-slate-300">Health</button>
+      </div>
+      <div id="chart-container" class="chart-box rounded bg-slate-900"></div>
+    </div>
+  </aside>
+
+  <!-- Chat panel -->
+  <main class="flex flex-col flex-1 overflow-hidden">
+
+    <!-- Messages -->
+    <div id="messages" class="flex-1 overflow-y-auto px-4 py-3 space-y-3"></div>
+
+    <!-- Thinking indicator -->
+    <div id="thinking" class="hidden px-4 py-1">
+      <div class="flex items-center gap-2 text-slate-400 text-sm">
+        <div class="w-2 h-2 bg-cyan-400 rounded-full animate-bounce"></div>
+        <div class="w-2 h-2 bg-cyan-400 rounded-full animate-bounce" style="animation-delay:.15s"></div>
+        <div class="w-2 h-2 bg-cyan-400 rounded-full animate-bounce" style="animation-delay:.3s"></div>
+        <span class="text-xs">Thinking…</span>
+      </div>
+    </div>
+
+    <!-- Input -->
+    <div class="px-4 py-3 border-t border-slate-700 bg-slate-800 shrink-0">
+      <div class="flex gap-2">
+        <textarea id="query-input" rows="2"
+          class="flex-1 resize-none bg-slate-700 text-slate-100 rounded-lg px-3 py-2 text-sm placeholder-slate-400 border border-slate-600 focus:outline-none focus:border-cyan-500 transition-colors"
+          placeholder="Ask a question… (Enter to send, Shift+Enter for newline)"></textarea>
+        <button id="send-btn" onclick="sendQuery()"
+          class="px-4 py-2 bg-cyan-700 hover:bg-cyan-600 text-white rounded-lg text-sm font-medium transition-colors self-end">
+          Send
+        </button>
+      </div>
+      <div class="mt-1 flex items-center justify-between">
+        <span id="intent-badge" class="text-xs text-slate-500"></span>
+        <span class="text-xs text-slate-600">Enter=send · Shift+Enter=newline · f=feedback</span>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+// ── state ──────────────────────────────────────────────────────────────────────
+let selectedProject = null;
+let lastQueryHash = null;
+let lastAssistantEl = null;
+let pendingClarification = null;   // { query } when agent asked for project
+let currentChart = 'stars';
+
+// Persistent session ID — survives page reload, gives the server a stable key
+// for the ConversationAgent so memory carries across turns.
+let sessionId = localStorage.getItem('pe_session_id');
+if (!sessionId) {
+  sessionId = crypto.randomUUID();
+  localStorage.setItem('pe_session_id', sessionId);
+}
+
+// ── init ───────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  loadProjects();
+  appendMessage('assistant', 'Welcome to **Project Explorer**! Select a project in the sidebar or ask a question across all projects.');
+  document.getElementById('query-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendQuery(); }
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'f' && document.activeElement.id !== 'query-input') feedback();
+  });
+});
+
+// ── projects ───────────────────────────────────────────────────────────────────
+async function loadProjects() {
+  const res = await fetch('/api/projects/');
+  const projects = await res.json();
+  const list = document.getElementById('project-list');
+  list.innerHTML = '';
+  projects.forEach(p => {
+    const colors = { active: 'text-green-400', indexing: 'text-yellow-400', error: 'text-red-400', paused: 'text-slate-500' };
+    const color = colors[p.status] || 'text-slate-400';
+    const btn = document.createElement('button');
+    btn.className = 'project-btn w-full text-left px-3 py-1.5 rounded text-sm hover:bg-slate-700 transition-colors';
+    btn.dataset.slug = p.slug;
+    btn.onclick = () => selectProject(p.slug);
+    btn.innerHTML = `<div class="font-medium text-slate-200 truncate">${p.display_name}</div>
+      <div class="text-xs ${color}">${p.status} · ${p.collections.length} collections</div>`;
+    list.appendChild(btn);
+  });
+}
+
+function selectProject(slug) {
+  selectedProject = slug;
+  document.querySelectorAll('.project-btn').forEach(b => b.classList.remove('selected'));
+  if (slug) {
+    document.querySelector(`[data-slug="${slug}"]`)?.classList.add('selected');
+    document.getElementById('scope-badge').textContent = slug;
+    document.getElementById('scope-badge').classList.remove('hidden');
+    document.getElementById('charts-section').classList.remove('hidden');
+    showChart(currentChart);
+    // If we were waiting for project clarification, re-run the original query
+    if (pendingClarification) {
+      const q = pendingClarification;
+      pendingClarification = null;
+      appendMessage('assistant', `Got it — scoping to **${slug}** and re-running your question…`);
+      runQuery(q.query, slug);
+    }
+  } else {
+    document.getElementById('scope-badge').classList.add('hidden');
+    document.getElementById('charts-section').classList.add('hidden');
+    document.querySelectorAll('.project-btn[data-slug=""]').forEach(b => b.classList.add('selected'));
+  }
+}
+
+// ── charts ─────────────────────────────────────────────────────────────────────
+async function showChart(type) {
+  if (!selectedProject) return;
+  currentChart = type;
+  const container = document.getElementById('chart-container');
+  container.innerHTML = '<div class="h-full flex items-center justify-center text-slate-500 text-xs">Loading…</div>';
+  try {
+    const res = await fetch(`/api/stats/${selectedProject}/charts/${type}`);
+    if (!res.ok) { container.innerHTML = '<div class="h-full flex items-center justify-center text-slate-500 text-xs">No data — run refresh first</div>'; return; }
+    const fig = await res.json();
+    // Dark theme overrides
+    fig.layout = fig.layout || {};
+    Object.assign(fig.layout, {
+      paper_bgcolor: '#0f172a', plot_bgcolor: '#0f172a',
+      font: { color: '#94a3b8', size: 10 },
+      margin: { l: 40, r: 10, t: 30, b: 30 },
+      height: 200,
+    });
+    if (fig.layout.xaxis) fig.layout.xaxis.gridcolor = '#1e293b';
+    if (fig.layout.yaxis) fig.layout.yaxis.gridcolor = '#1e293b';
+    Plotly.newPlot(container, fig.data, fig.layout, { displayModeBar: false, responsive: true });
+  } catch (e) {
+    container.innerHTML = `<div class="h-full flex items-center justify-center text-red-400 text-xs">${e.message}</div>`;
+  }
+}
+
+// ── chat ───────────────────────────────────────────────────────────────────────
+async function sendQuery() {
+  const input = document.getElementById('query-input');
+  const query = input.value.trim();
+  if (!query) return;
+  input.value = '';
+  appendMessage('you', query);
+  // If awaiting clarification, treat input as the project name
+  if (pendingClarification) {
+    const origQuery = pendingClarification.query;
+    pendingClarification = null;
+    const slug = query.replace(/^project:/i, '').trim().replace(/\s+/g, '_').toLowerCase();
+    appendMessage('assistant', `Scoping to **${slug}**…`);
+    runQuery(origQuery, slug);
+    return;
+  }
+  runQuery(query, selectedProject);
+}
+
+async function runQuery(query, projectSlug) {
+  setThinking(true);
+  document.getElementById('intent-badge').textContent = '';
+
+  // Create a placeholder message to stream into
+  const messages = document.getElementById('messages');
+  const wrap = document.createElement('div');
+  wrap.className = 'msg-assistant pl-3 pr-2 py-2 rounded-r-lg bg-slate-800/60';
+  const header = document.createElement('div');
+  header.className = 'text-xs font-semibold mb-1 text-emerald-400';
+  header.textContent = 'Assistant';
+  wrap.appendChild(header);
+  const body = document.createElement('div');
+  body.className = 'prose prose-invert text-sm text-slate-200 max-w-none';
+  wrap.appendChild(body);
+  messages.appendChild(wrap);
+  messages.scrollTop = messages.scrollHeight;
+  lastAssistantEl = wrap;
+
+  let accumulated = '';
+  try {
+    const res = await fetch('/api/query/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, project_slug: projectSlug, session_id: sessionId }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+
+      // Parse complete SSE lines (each ends with \n\n)
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 2);
+        if (!line.startsWith('data:')) continue;
+        const event = JSON.parse(line.slice(5).trim());
+
+        if (event.t === 'chunk') {
+          accumulated += event.v;
+          // Show plain text while streaming; markdown on done
+          body.textContent = accumulated;
+          messages.scrollTop = messages.scrollHeight;
+
+        } else if (event.t === 'done') {
+          lastQueryHash = event.hash;
+          document.getElementById('intent-badge').textContent = `intent: ${event.intent}`;
+
+          // Re-render as markdown
+          const isClarification = accumulated.startsWith('Which project are you asking about?');
+          if (isClarification) {
+            wrap.classList.add('clarify');
+            header.className = 'text-xs font-semibold mb-1 text-amber-400';
+            header.textContent = 'Assistant · clarification needed';
+            pendingClarification = { query };
+          }
+          body.innerHTML = marked.parse(accumulated);
+
+          // Inline chart if provided
+          if (event.chart) {
+            const chartDiv = document.createElement('div');
+            chartDiv.className = 'mt-2 rounded bg-slate-900';
+            chartDiv.style.height = '240px';
+            wrap.appendChild(chartDiv);
+            const fig = event.chart;
+            fig.layout = fig.layout || {};
+            Object.assign(fig.layout, {
+              paper_bgcolor: '#0f172a', plot_bgcolor: '#0f172a',
+              font: { color: '#94a3b8', size: 10 },
+              margin: { l: 40, r: 10, t: 30, b: 30 },
+              height: 230,
+            });
+            if (fig.layout.xaxis) fig.layout.xaxis.gridcolor = '#1e293b';
+            if (fig.layout.yaxis) fig.layout.yaxis.gridcolor = '#1e293b';
+            requestAnimationFrame(() => {
+              Plotly.newPlot(chartDiv, fig.data, fig.layout, { displayModeBar: false, responsive: true });
+            });
+          }
+
+          // Feedback buttons
+          if (event.hash) {
+            const fb = document.createElement('div');
+            fb.className = 'mt-1.5 flex gap-2';
+            fb.innerHTML = `
+              <button onclick="recordFeedback('${event.hash}', 1, this)" class="text-xs text-slate-500 hover:text-green-400 transition-colors">👍</button>
+              <button onclick="recordFeedback('${event.hash}', -1, this)" class="text-xs text-slate-500 hover:text-red-400 transition-colors">👎</button>`;
+            wrap.appendChild(fb);
+          }
+          messages.scrollTop = messages.scrollHeight;
+        }
+      }
+    }
+  } catch (e) {
+    body.innerHTML = marked.parse(`**Error:** ${e.message}`);
+  } finally {
+    setThinking(false);
+  }
+}
+
+function appendMessage(role, text, opts = {}) {
+  const messages = document.getElementById('messages');
+  const wrap = document.createElement('div');
+  wrap.className = `msg-${role} pl-3 pr-2 py-2 rounded-r-lg bg-slate-800/60 ${opts.clarify ? 'clarify' : ''}`;
+
+  const header = document.createElement('div');
+  header.className = 'text-xs font-semibold mb-1 ' + (role === 'you' ? 'text-cyan-400' : opts.clarify ? 'text-amber-400' : 'text-emerald-400');
+  header.textContent = role === 'you' ? 'You' : opts.clarify ? 'Assistant · clarification needed' : 'Assistant';
+  wrap.appendChild(header);
+
+  const body = document.createElement('div');
+  body.className = 'prose prose-invert text-sm text-slate-200 max-w-none';
+  body.innerHTML = marked.parse(text);
+  wrap.appendChild(body);
+
+  // chart and feedback buttons are injected by runQuery() after the stream completes
+
+  messages.appendChild(wrap);
+  messages.scrollTop = messages.scrollHeight;
+  return wrap;
+}
+
+// ── feedback ───────────────────────────────────────────────────────────────────
+async function recordFeedback(hash, vote, btn) {
+  await fetch('/api/query/feedback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query_hash: hash, vote }),
+  });
+  btn.parentElement.innerHTML = vote > 0
+    ? '<span class="text-xs text-green-400">👍 Thanks!</span>'
+    : '<span class="text-xs text-red-400">👎 Noted.</span>';
+}
+
+function feedback() {
+  if (!lastAssistantEl || !lastQueryHash) return;
+  const fb = lastAssistantEl.querySelector('.mt-1\\.5');
+  if (fb) fb.querySelector('button')?.click();
+}
+
+// ── utils ──────────────────────────────────────────────────────────────────────
+function setThinking(on) {
+  document.getElementById('thinking').classList.toggle('hidden', !on);
+  document.getElementById('send-btn').disabled = on;
+  document.getElementById('send-btn').classList.toggle('opacity-50', on);
+}
+</script>
+</body>
+</html>

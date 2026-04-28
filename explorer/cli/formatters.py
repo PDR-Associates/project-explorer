@@ -19,21 +19,28 @@ def print_project_table(projects: list[Project], console: Console, details: bool
 
 
 def _print_project_summary(projects: list[Project], console: Console) -> None:
+    from explorer.multi_collection_store import MultiCollectionStore
+    store = MultiCollectionStore()
+
     table = Table(title="Registered Projects")
     table.add_column("Slug", style="cyan")
     table.add_column("Name")
     table.add_column("Status")
-    table.add_column("Collections", justify="right")
+    table.add_column("Collections")
+    table.add_column("Vectors", justify="right")
     table.add_column("Last Indexed")
     for p in projects:
         status_color = {"active": "green", "indexing": "yellow", "paused": "dim", "error": "red"}.get(
             p.status.value, "white"
         )
+        col_types = [c.removeprefix(f"{p.slug}_") for c in sorted(p.collections)]
+        total_vecs = sum(store.count(c) for c in p.collections)
         table.add_row(
             p.slug,
             p.display_name,
             f"[{status_color}]{p.status.value}[/{status_color}]",
-            str(len(p.collections)),
+            ", ".join(col_types) if col_types else "[dim]none[/dim]",
+            f"{total_vecs:,}" if total_vecs else "[dim]0[/dim]",
             p.last_indexed_at[:10] if p.last_indexed_at else "never",
         )
     console.print(table)
