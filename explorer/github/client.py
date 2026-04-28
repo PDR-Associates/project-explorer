@@ -36,20 +36,56 @@ class GitHubClient:
         Download entire repo as a single zipball (1 API call) and extract it.
         Returns the extracted repo root directory inside dest_dir.
         Far more rate-limit-friendly than fetching files individually.
+        Retries up to 3 times on transient network errors.
         """
-        import io
+        import time
         import zipfile
         from pathlib import Path
         import requests
+        from requests.exceptions import ConnectionError, SSLError, Timeout
 
+        cfg = get_config().github
         branch = repo.default_branch
         url = f"https://api.github.com/repos/{repo.full_name}/zipball/{branch}"
-        token = get_config().github.token
-        headers = {"Authorization": f"token {token}"} if token else {}
-        resp = requests.get(url, headers=headers, stream=True, timeout=300)
-        resp.raise_for_status()
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        headers = {"Authorization": f"token {cfg.token}"} if cfg.token else {}
+        zip_path = Path(dest_dir) / "_repo.zip"
+
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    url, headers=headers, stream=True,
+                    timeout=cfg.clone_timeout_seconds,
+                    verify=cfg.ssl_verify,
+                )
+                resp.raise_for_status()
+                with open(zip_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
+                last_exc = None
+                break
+            except SSLError as exc:
+                raise RuntimeError(
+                    f"SSL error downloading repo — {exc}\n"
+                    "Fixes:\n"
+                    "  • pip install --upgrade certifi\n"
+                    "  • set REQUESTS_CA_BUNDLE=/path/to/your-ca-bundle.pem in .env\n"
+                    "  • set GITHUB__SSL_VERIFY=false in .env to skip verification (insecure)"
+                ) from exc
+            except (ConnectionError, Timeout) as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+
+        if last_exc:
+            raise RuntimeError(
+                f"Network error downloading repo after 3 attempts — {last_exc}"
+            ) from last_exc
+
+        with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(dest_dir)
+        zip_path.unlink(missing_ok=True)
+
         # GitHub zips have a single top-level dir named "owner-repo-sha"
         subdirs = [d for d in Path(dest_dir).iterdir() if d.is_dir()]
         return subdirs[0] if subdirs else Path(dest_dir)
