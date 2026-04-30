@@ -72,26 +72,65 @@ class BaseExplorerAgent(ABC):
         Uses whole-word matching and returns the longest match to resolve ambiguity
         (e.g. 'egeria_workspaces' beats 'egeria' when the query mentions 'egeria-workspaces').
         """
+        slugs = self._infer_all_project_slugs(query)
+        return slugs[0] if slugs else None
+
+    def _infer_all_project_slugs(self, query: str) -> list[str]:
+        """
+        Return all project slugs mentioned in the query, ordered by position in the query text.
+        Falls back to alias table lookup when no direct slug/name match is found.
+        Used by CompareAgent to identify multiple projects from a single query string.
+        """
         import re
+        results: list[tuple[int, str]] = []
         try:
             from explorer.registry import ProjectRegistry
+            registry = ProjectRegistry()
             q = query.lower()
-            q_normalized = q.replace("-", "_")  # normalize hyphens so slug match works
-            best_slug: str | None = None
-            best_len = 0
-            for project in ProjectRegistry().list_all():
+            q_normalized = q.replace("-", "_")
+            for project in registry.list_all():
                 slug = project.slug.lower()
-                matched = bool(re.search(r"\b" + re.escape(slug) + r"\b", q_normalized))
-                if not matched and project.display_name:
-                    # Split on hyphens and spaces so "egeria-workspaces" → ["egeria","workspaces"]
+                slug_pattern = slug.replace("_", r"[-_ ]")
+                m = re.search(r"\b" + slug_pattern + r"\b", q_normalized)
+                pos = m.start() if m else None
+                if pos is None and project.display_name:
                     words = re.split(r"[-\s]+", project.display_name.lower())
-                    matched = bool(words and all(w in q for w in words))
-                if matched and len(slug) > best_len:
-                    best_slug = project.slug
-                    best_len = len(slug)
+                    if words:
+                        m = re.search(r"\b" + re.escape(words[0]) + r"\b", q)
+                        if m and all(w in q for w in words):
+                            pos = m.start()
+                if pos is not None:
+                    results.append((pos, project.slug))
+
+            # Fall back to alias lookup when no direct match found
+            if not results:
+                alias_slug = self._lookup_alias(q_normalized, registry)
+                if alias_slug:
+                    results.append((0, alias_slug))
         except Exception:
             pass
-        return best_slug
+        results.sort(key=lambda x: x[0])
+        return [slug for _, slug in results]
+
+    def _lookup_alias(self, query_normalized: str, registry=None) -> str | None:
+        """
+        Check the alias table for any 1–4 word ngram in the query.
+        query_normalized should already be lowercased with hyphens→underscores.
+        """
+        try:
+            if registry is None:
+                from explorer.registry import ProjectRegistry
+                registry = ProjectRegistry()
+            words = query_normalized.split()
+            for n in range(min(4, len(words)), 0, -1):
+                for i in range(len(words) - n + 1):
+                    term = "_".join(words[i:i + n])
+                    slug = registry.resolve_alias(term)
+                    if slug:
+                        return slug
+        except Exception:
+            pass
+        return None
 
     def _clarification_response(self, query: str) -> str:
         """Return a natural-language question asking which project the user means."""

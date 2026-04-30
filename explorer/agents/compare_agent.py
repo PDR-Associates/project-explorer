@@ -25,11 +25,20 @@ class CompareAgent(BaseExplorerAgent):
             query_project_stats,
             query_top_committers,
             query_commit_activity,
+            query_code_symbols,
+            get_symbol_detail,
         )
-        return [vector_search, query_project_stats, query_top_committers, query_commit_activity]
+        return [
+            vector_search,
+            query_project_stats,
+            query_top_committers,
+            query_commit_activity,
+            query_code_symbols,
+            get_symbol_detail,
+        ]
 
     def handle(self, query: str, project_slug: str | None = None, **kwargs) -> str:
-        slugs = self._extract_project_slugs(query)
+        slugs = self._infer_all_project_slugs(query)
 
         if len(slugs) < 2:
             from explorer.registry import ProjectRegistry
@@ -113,19 +122,3 @@ class CompareAgent(BaseExplorerAgent):
         )
         return get_llm().complete(fallback_prompt)
 
-    def _extract_project_slugs(self, query: str) -> list[str]:
-        import re
-        from explorer.registry import ProjectRegistry
-
-        known = {p.slug: p for p in ProjectRegistry().list_all()}
-        query_lower = query.lower()
-        found: list[str] = []
-
-        for slug, project in known.items():
-            slug_pattern = slug.replace("_", r"[-_ ]")
-            display = re.escape(project.display_name.lower())
-            if re.search(rf"\b{slug_pattern}\b", query_lower) or \
-               re.search(rf"\b{display}\b", query_lower):
-                found.append(slug)
-
-        return found

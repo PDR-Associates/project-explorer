@@ -121,6 +121,48 @@ class IngestionPipeline:
         return self.store.insert(collection_name, [c.text for c in chunks],
                                  [c.metadata for c in chunks])
 
+    def extract_symbols_only(self, project_slug: str, github_url: str, collections: list[str]) -> int:
+        """
+        Download the repo and extract code symbols to SQLite without touching Milvus.
+
+        Used to backfill symbols for projects that were indexed before code intelligence
+        was added, and by 'refresh --symbols' when code hasn't changed.
+        Returns the total number of symbols extracted.
+        """
+        from explorer.github.client import GitHubClient
+        from explorer.ingestion.code_symbol_extractor import CodeSymbolExtractor
+        from config.collection_config import COLLECTION_TYPES
+
+        code_ctypes = [
+            COLLECTION_TYPES[name]
+            for name in self._CTYPE_LANGUAGE
+            if name in COLLECTION_TYPES and f"{project_slug}_{name}" in collections
+        ]
+        if not code_ctypes:
+            return 0
+
+        client = GitHubClient()
+        repo = client.get_repo(github_url)
+        extractor = CodeSymbolExtractor()
+        total = 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.console.print("[cyan]Downloading repository for symbol extraction...[/cyan]")
+            local_root = client.download_zipball(repo, Path(tmp))
+
+            for ctype in code_ctypes:
+                language = self._CTYPE_LANGUAGE[ctype.name]
+                self.registry.clear_code_symbols(project_slug, language)
+                symbols = []
+                for path, content in self._local_files(local_root, ctype.file_extensions):
+                    symbols.extend(extractor.extract(path, content, project_slug, language))
+                if symbols:
+                    self.registry.upsert_code_symbols(project_slug, symbols)
+                    total += len(symbols)
+                    self.console.print(f"  [dim]{ctype.name}: {len(symbols)} symbols[/dim]")
+
+        return total
+
     # ── local file helpers ────────────────────────────────────────────────────
 
     def _local_files(self, local_root: Path, extensions: list[str]) -> list[tuple[str, str]]:
@@ -140,12 +182,35 @@ class IngestionPipeline:
 
     # ── per-collection-type ingestors ─────────────────────────────────────────
 
+    _CTYPE_LANGUAGE: dict[str, str] = {
+        "python_code": "python",
+        "javascript_code": "javascript",
+        "java_code": "java",
+        "go_code": "go",
+    }
+
     def _ingest_code(self, local_root: Path, project_slug: str, ctype: CollectionType) -> list:
         from explorer.ingestion.code_parser import CodeParser
+        from explorer.ingestion.code_symbol_extractor import CodeSymbolExtractor
+
+        language = self._CTYPE_LANGUAGE.get(ctype.name, "")
         parser = CodeParser(ctype.chunk_size, ctype.chunk_overlap)
+        extractor = CodeSymbolExtractor() if language else None
+
+        # Clear stale symbols for this language before re-ingesting
+        if language:
+            self.registry.clear_code_symbols(project_slug, language)
+
         chunks = []
+        all_symbols = []
         for path, content in self._local_files(local_root, ctype.file_extensions):
             chunks.extend(parser.parse(path, content, project_slug))
+            if extractor:
+                all_symbols.extend(extractor.extract(path, content, project_slug, language))
+
+        if all_symbols:
+            self.registry.upsert_code_symbols(project_slug, all_symbols)
+
         return chunks
 
     def _ingest_markdown(self, local_root: Path, project_slug: str, ctype: CollectionType) -> list:

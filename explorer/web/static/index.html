@@ -27,6 +27,7 @@
     .prose th { background: #1e293b; }
     .chart-box { height: 220px; margin-bottom: .5rem; }
     .project-btn.selected { background: #0e7490 !important; }
+    .project-btn.compare-selected { background: #92400e !important; outline: 1px solid #f59e0b; }
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: #0f172a; }
     ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
@@ -112,6 +113,7 @@
 <script>
 // ── state ──────────────────────────────────────────────────────────────────────
 let selectedProject = null;
+let compareSet = new Set();   // slugs selected via Shift+click for multi-project mode
 let lastQueryHash = null;
 let lastAssistantEl = null;
 let pendingClarification = null;   // { query } when agent asked for project
@@ -149,7 +151,7 @@ async function loadProjects() {
     const btn = document.createElement('button');
     btn.className = 'project-btn w-full text-left px-3 py-1.5 rounded text-sm hover:bg-slate-700 transition-colors';
     btn.dataset.slug = p.slug;
-    btn.onclick = () => selectProject(p.slug);
+    btn.onclick = (e) => e.shiftKey ? toggleCompare(p.slug) : selectProject(p.slug);
     btn.innerHTML = `<div class="font-medium text-slate-200 truncate">${p.display_name}</div>
       <div class="text-xs ${color}">${p.status} · ${p.collections.length} collections</div>`;
     list.appendChild(btn);
@@ -157,15 +159,17 @@ async function loadProjects() {
 }
 
 function selectProject(slug) {
+  compareSet.clear();
   selectedProject = slug;
-  document.querySelectorAll('.project-btn').forEach(b => b.classList.remove('selected'));
+  document.querySelectorAll('.project-btn').forEach(b => {
+    b.classList.remove('selected', 'compare-selected');
+  });
   if (slug) {
     document.querySelector(`[data-slug="${slug}"]`)?.classList.add('selected');
     document.getElementById('scope-badge').textContent = slug;
     document.getElementById('scope-badge').classList.remove('hidden');
     document.getElementById('charts-section').classList.remove('hidden');
     showChart(currentChart);
-    // If we were waiting for project clarification, re-run the original query
     if (pendingClarification) {
       const q = pendingClarification;
       pendingClarification = null;
@@ -176,6 +180,42 @@ function selectProject(slug) {
     document.getElementById('scope-badge').classList.add('hidden');
     document.getElementById('charts-section').classList.add('hidden');
     document.querySelectorAll('.project-btn[data-slug=""]').forEach(b => b.classList.add('selected'));
+  }
+}
+
+function toggleCompare(slug) {
+  // Add primary project to compare set first if none selected
+  if (selectedProject && !compareSet.has(selectedProject)) {
+    compareSet.add(selectedProject);
+  }
+  if (compareSet.has(slug)) {
+    compareSet.delete(slug);
+    document.querySelector(`[data-slug="${slug}"]`)?.classList.remove('compare-selected');
+  } else {
+    compareSet.add(slug);
+    document.querySelector(`[data-slug="${slug}"]`)?.classList.add('compare-selected');
+  }
+  // Update scope badge
+  const badge = document.getElementById('scope-badge');
+  if (compareSet.size >= 2) {
+    badge.textContent = [...compareSet].join(' + ');
+    badge.classList.remove('hidden');
+    badge.classList.add('text-amber-300');
+    document.getElementById('charts-section').classList.add('hidden');
+  } else if (compareSet.size === 1) {
+    const only = [...compareSet][0];
+    badge.textContent = only;
+    badge.classList.remove('hidden', 'text-amber-300');
+    selectedProject = only;
+    compareSet.clear();
+    document.querySelectorAll('.project-btn').forEach(b => b.classList.remove('selected', 'compare-selected'));
+    document.querySelector(`[data-slug="${only}"]`)?.classList.add('selected');
+    document.getElementById('charts-section').classList.remove('hidden');
+    showChart(currentChart);
+  } else {
+    selectedProject = null;
+    badge.classList.add('hidden');
+    badge.classList.remove('text-amber-300');
   }
 }
 
@@ -221,7 +261,14 @@ async function sendQuery() {
     runQuery(origQuery, slug);
     return;
   }
-  runQuery(query, selectedProject);
+  // In compare mode, prefix query with project names to trigger CompareAgent/IntegrationAgent
+  if (compareSet.size >= 2) {
+    const slugList = [...compareSet];
+    const prefixed = slugList.join(' and ') + ': ' + query;
+    runQuery(prefixed, null);
+  } else {
+    runQuery(query, selectedProject);
+  }
 }
 
 async function runQuery(query, projectSlug) {
@@ -310,6 +357,56 @@ async function runQuery(query, projectSlug) {
             });
           }
 
+          // Symbol table for code_inventory queries
+          if (event.symbol_table && event.symbol_table.items && event.symbol_table.items.length) {
+            const st = event.symbol_table;
+            const tableWrap = document.createElement('div');
+            tableWrap.className = 'mt-3 overflow-x-auto rounded border border-slate-700';
+            const caption = `${st.total} ${st.kind === 'all' ? 'symbol' : st.kind}(s) in ${st.project}` +
+              (st.total > st.items.length ? ` — showing first ${st.items.length}` : '');
+            tableWrap.innerHTML = `
+              <div class="px-3 py-1.5 bg-slate-800 text-xs text-slate-400 flex justify-between items-center">
+                <span>${caption}</span>
+                <span class="text-slate-600">Shift+click column header to sort</span>
+              </div>
+              <table class="w-full text-xs" id="sym-table-${Date.now()}">
+                <thead class="bg-slate-800/80 text-slate-400">
+                  <tr>
+                    <th class="px-2 py-1 text-left cursor-pointer hover:text-slate-200 select-none" onclick="sortSymTable(this,0)">Kind</th>
+                    <th class="px-2 py-1 text-left cursor-pointer hover:text-slate-200 select-none" onclick="sortSymTable(this,1)">Name</th>
+                    <th class="px-2 py-1 text-left cursor-pointer hover:text-slate-200 select-none hidden sm:table-cell" onclick="sortSymTable(this,2)">Signature</th>
+                    <th class="px-2 py-1 text-left cursor-pointer hover:text-slate-200 select-none hidden md:table-cell" onclick="sortSymTable(this,3)">File</th>
+                    <th class="px-2 py-1 text-left text-slate-600 hidden lg:table-cell">Purpose</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-700/50">
+                  ${st.items.map(s => `
+                    <tr class="hover:bg-slate-700/30 transition-colors">
+                      <td class="px-2 py-1 text-cyan-400 font-mono">${s.kind}</td>
+                      <td class="px-2 py-1 text-slate-200 font-mono">${s.name}</td>
+                      <td class="px-2 py-1 text-slate-400 font-mono truncate max-w-xs hidden sm:table-cell">${s.signature}</td>
+                      <td class="px-2 py-1 text-slate-500 truncate max-w-xs hidden md:table-cell">${s.file}:${s.line}</td>
+                      <td class="px-2 py-1 text-slate-500 truncate max-w-xs hidden lg:table-cell">${s.doc}</td>
+                    </tr>`).join('')}
+                </tbody>
+              </table>`;
+            wrap.appendChild(tableWrap);
+          }
+
+          // Alias suggestion banner
+          if (event.alias_suggestion) {
+            const as = event.alias_suggestion;
+            const banner = document.createElement('div');
+            banner.className = 'mt-2 flex items-center gap-2 rounded bg-amber-900/40 border border-amber-700/50 px-3 py-1.5 text-xs text-amber-300';
+            banner.innerHTML = `
+              <span><strong>"${as.term}"</strong> looks like <strong>${as.candidate_name}</strong>. Remember this alias?</span>
+              <button class="ml-auto px-2 py-0.5 rounded bg-amber-700/60 hover:bg-amber-600 text-white transition-colors"
+                onclick="confirmAlias('${as.term}', '${as.candidate_slug}', this.parentElement)">Yes</button>
+              <button class="px-2 py-0.5 rounded text-amber-500 hover:text-amber-300 transition-colors"
+                onclick="this.parentElement.remove()">No</button>`;
+            wrap.appendChild(banner);
+          }
+
           // Feedback buttons
           if (event.hash) {
             const fb = document.createElement('div');
@@ -362,6 +459,30 @@ async function recordFeedback(hash, vote, btn) {
   btn.parentElement.innerHTML = vote > 0
     ? '<span class="text-xs text-green-400">👍 Thanks!</span>'
     : '<span class="text-xs text-red-400">👎 Noted.</span>';
+}
+
+function sortSymTable(th, colIdx) {
+  const table = th.closest('table');
+  const tbody = table.querySelector('tbody');
+  const rows = [...tbody.querySelectorAll('tr')];
+  const asc = th.dataset.sortAsc !== 'true';
+  th.dataset.sortAsc = asc;
+  rows.sort((a, b) => {
+    const av = a.cells[colIdx]?.textContent.trim() || '';
+    const bv = b.cells[colIdx]?.textContent.trim() || '';
+    return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+  });
+  rows.forEach(r => tbody.appendChild(r));
+}
+
+async function confirmAlias(term, slug, banner) {
+  await fetch('/api/aliases/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ alias: term, project_slug: slug }),
+  });
+  banner.innerHTML = `<span class="text-amber-400">Alias saved — "${term}" will resolve to ${slug} in future queries.</span>`;
+  setTimeout(() => banner.remove(), 3000);
 }
 
 function feedback() {

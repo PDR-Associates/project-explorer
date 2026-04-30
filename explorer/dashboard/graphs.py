@@ -100,6 +100,7 @@ def stars_over_time_plotly(project_slug: str) -> "plotly.graph_objects.Figure":
         title=f"Stars over time — {project_slug}",
         xaxis_title="Date",
         yaxis_title="Stars",
+        yaxis_rangemode="tozero",
     )
     return fig
 
@@ -117,6 +118,7 @@ def commits_over_time_plotly(project_slug: str) -> "plotly.graph_objects.Figure"
         title=f"Commit activity — {project_slug}",
         xaxis_title="Snapshot date",
         yaxis_title="Commits (30-day window)",
+        yaxis_rangemode="tozero",
     )
     return fig
 
@@ -160,6 +162,7 @@ def weekly_commits_plotly(project_slug: str) -> "plotly.graph_objects.Figure":
         title=f"Weekly commit activity — {project_slug}",
         xaxis_title="Week starting",
         yaxis_title="Commits",
+        yaxis_rangemode="tozero",
     )
     return fig
 

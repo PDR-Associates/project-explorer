@@ -48,8 +48,19 @@ class ConversationAgent(BaseExplorerAgent):
             query_project_stats,
             query_top_committers,
             query_commit_activity,
+            query_contributor_profile,
+            query_code_symbols,
+            get_symbol_detail,
         )
-        return [vector_search, query_project_stats, query_top_committers, query_commit_activity]
+        return [
+            vector_search,
+            query_project_stats,
+            query_top_committers,
+            query_commit_activity,
+            query_contributor_profile,
+            query_code_symbols,
+            get_symbol_detail,
+        ]
 
     def _get_agent(self):
         """Return the persistent agent, creating it once on first use."""

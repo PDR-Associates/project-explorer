@@ -438,14 +438,14 @@ class TestCompareAgentProjectExtraction:
     def test_extracts_both_slugs_from_comparison_query(self, two_projects):
         from explorer.agents.compare_agent import CompareAgent
         agent = CompareAgent()
-        slugs = agent._extract_project_slugs("compare alpha and beta")
+        slugs = agent._infer_all_project_slugs("compare alpha and beta")
         assert "alpha" in slugs
         assert "beta" in slugs
 
     def test_extracts_by_display_name(self, two_projects):
         from explorer.agents.compare_agent import CompareAgent
         agent = CompareAgent()
-        slugs = agent._extract_project_slugs(
+        slugs = agent._infer_all_project_slugs(
             "compare Alpha Project versus Beta Framework"
         )
         assert "alpha" in slugs
@@ -454,7 +454,7 @@ class TestCompareAgentProjectExtraction:
     def test_missing_one_project_returns_short_list(self, two_projects):
         from explorer.agents.compare_agent import CompareAgent
         agent = CompareAgent()
-        slugs = agent._extract_project_slugs("compare alpha and something_unknown")
+        slugs = agent._infer_all_project_slugs("compare alpha and something_unknown")
         assert "alpha" in slugs
         assert "beta" not in slugs
 

@@ -41,6 +41,7 @@ flowchart TD
 
     QP -->|statistical| StatsAgent
     QP -->|health| HealthAgent
+    QP -->|code_inventory| CodeAgent
     QP -->|code_search| CodeAgent
     QP -->|conceptual| DocAgent
     QP -->|comparison| CompareAgent
@@ -52,6 +53,7 @@ flowchart TD
     Rerank --> LLM
 
     StatsAgent & HealthAgent --> SQLite["SQLite\n(project_stats\nproject_commits)"]
+    CodeAgent --> SQLite2["SQLite\n(project_code_symbols)"]
     LLM --> Cache
     Cache --> User
     User --> Obs
@@ -146,7 +148,7 @@ classDiagram
     class ConversationAgent {
         _agent: RequirementAgent (persistent)
         memory: TokenMemory(max_tokens=8000)
-        tools: all four tools
+        tools: all six tools
         Falls back to RAGSystem.query()
     }
 
@@ -176,6 +178,9 @@ Agents use `@tool`-decorated functions. BeeAI's `RequirementAgent` calls tools i
 | `query_project_stats(project_slug)` | Stats, Health, Compare, Conversation | Returns formatted stats from SQLite; commit counts prefer live `project_commits` data |
 | `query_top_committers(project_slug, limit)` | Stats, Health, Conversation | Returns ranked contributor list (90d) from `project_commits` |
 | `query_commit_activity(project_slug)` | Stats, Conversation | Returns weekly commit trend as text chart (last 12 weeks) |
+| `query_code_symbols(project_slug, kind, pattern, file_path, limit)` | Code, Conversation | Lists/counts classes, functions, methods from `project_code_symbols` SQLite table |
+| `get_symbol_detail(project_slug, name)` | Code, Conversation | Returns full signature, docstring, and lazy LLM summary for a named symbol |
+| `query_contributor_profile(project_slug, author, days)` | Stats, Conversation | Detailed contributor profile: commits, lines added/deleted, tier (core/regular/occasional), relative comparison |
 
 ### Project Inference and Clarification
 
@@ -257,15 +262,19 @@ The browser generates a `crypto.randomUUID()` on first load and stores it in `lo
 
 `graphs.py` provides five Plotly figure builders:
 
-| Function | Chart type | Data source |
-|---|---|---|
-| `stars_over_time_plotly` | Line | `project_stats` snapshots |
-| `commits_over_time_plotly` | Bar | `project_stats` snapshots (30d window per snapshot) |
-| `weekly_commits_plotly` | Bar | `project_commits` (live per-commit data, last 13 weeks) |
-| `language_breakdown_plotly` | Pie | `project_stats` latest row |
-| `health_radar_plotly` | Radar | `project_stats` latest row |
+| Function | Chart type | Data source | Used by |
+|---|---|---|---|
+| `stars_over_time_plotly` | Line | `project_stats` snapshots | Sidebar Stars tab, `/charts/stars` |
+| `commits_over_time_plotly` | Bar | `project_stats` snapshots (30d window per snapshot) | `/charts/commits_snapshot` (internal) |
+| `weekly_commits_plotly` | Bar | `project_commits` (live per-commit data, last 13 weeks) | Sidebar Commits tab, `/charts/commits`, inline chart |
+| `language_breakdown_plotly` | Pie | `project_stats` latest row | Sidebar Languages tab, `/charts/languages` |
+| `health_radar_plotly` | Radar | `project_stats` latest row | Sidebar Health tab, `/charts/health` |
 
-`weekly_commits_plotly` is selected automatically when a query contains "week", "weekly", "per week", or "week-by-week". All five are available as sidebar chart tabs and via `GET /api/stats/{slug}/charts/{type}`.
+The `/charts/commits` endpoint uses `weekly_commits_plotly` (live per-commit data) rather than the snapshot-based `commits_over_time_plotly`. This produces a meaningful chart even with only one stats snapshot, because it reads actual commit timestamps from `project_commits` and bins them into 13 weekly buckets.
+
+All bar and line charts include `yaxis_rangemode="tozero"` so the y-axis always starts from zero — single data points render as visible bars rather than flat lines.
+
+`weekly_commits_plotly` is also selected for inline chat charts when a query contains "week", "weekly", "per week", or "week-by-week". Chart endpoints are available via `GET /api/stats/{slug}/charts/{type}`.
 
 The frontend uses:
 - **Tailwind CSS** (CDN) for styling
@@ -388,12 +397,30 @@ The project registry (`~/.project-explorer/projects.db` by default) maintains th
 | `projects` | Project metadata: slug, display_name, github_url, status, collections, indexed_at |
 | `project_stats` | GitHub stats snapshots: stars, forks, contributors, commits_30d, commits_90d, etc. |
 | `project_commits` | 90-day commit history: sha, message, author_name, author_email, committed_at |
+| `project_code_symbols` | Extracted code symbols: classes, functions, methods, interfaces with signatures and docstrings |
+| `project_contributor_stats` | Aggregated per-contributor metrics per period: commits, additions, deletions, tier (core/regular/occasional) |
 
 `project_commits` uses `UNIQUE(project_slug, sha)` with `INSERT OR IGNORE` for idempotent fetches. All commit count queries (30d, 90d, weekly) read from this table rather than the snapshot columns in `project_stats` — this ensures consistency between the count displayed in stats and the committer list.
+
+`project_code_symbols` uses `UNIQUE(project_slug, file_path, qualified_name)` with `INSERT OR REPLACE` for idempotent refresh. Symbols are extracted during ingestion by `CodeSymbolExtractor` alongside the chunker. The `summary` column is populated lazily on first `get_symbol_detail` call if no docstring exists. Run `project-explorer refresh <slug> --symbols --no-stats` to backfill symbols for projects indexed before code intelligence was added.
 
 ---
 
 ## Key Design Decisions
+
+### Log Suppression
+
+The CLI suppresses noisy output from gRPC, HuggingFace `transformers`, `tqdm`, and the tokenizer parallelism warning at module load time by setting five environment variables before any heavy imports:
+
+```python
+os.environ.setdefault("GRPC_VERBOSITY", "NONE")
+os.environ.setdefault("GLOG_minloglevel", "3")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TQDM_DISABLE", "1")
+```
+
+`setdefault` is used so that explicitly set env vars (in a shell or `.env`) are never overridden. Set `DEBUG=1` before any command to restore verbose output.
 
 ### Intent Classification Before Retrieval
 
@@ -410,6 +437,26 @@ The project registry (`~/.project-explorer/projects.db` by default) maintains th
 ### Session-Based Memory for Web UI
 
 The web UI uses a `session_id` UUID (generated by `crypto.randomUUID()`, persisted in `localStorage`) to maintain a persistent `ConversationAgent` server-side. This gives the web UI the same cross-turn memory as the CLI and TUI without requiring server-side login or cookies. Sessions expire after 30 minutes idle; the server caps at 50 concurrent sessions (LRU eviction).
+
+### TUI Pre-Warming Is Fault-Tolerant
+
+The TUI `run()` entry point pre-warms the embedding model and Milvus client in the main thread to prevent gRPC/PyTorch FD conflicts when they initialize inside a Textual worker thread. Each pre-warm step is wrapped independently in `try/except` so a failed model download or Milvus connectivity issue does not prevent the TUI from starting — errors surface inline in the chat area when a query is first submitted:
+
+```python
+try:
+    get_embedding_model()   # non-fatal if model unavailable
+except Exception:
+    pass
+
+try:
+    MultiCollectionStore()._get_client()   # non-fatal if Milvus unavailable
+except Exception:
+    pass
+
+rag = RAGSystem()   # lightweight; actual connections happen lazily
+conv = ConversationAgent(rag_system=rag)
+ProjectExplorerApp(conv, rag).run()
+```
 
 ### Milvus Schema
 

@@ -9,6 +9,16 @@ from explorer.registry import ProjectRegistry
 
 _COMMIT_LOOKBACK_DAYS = 90
 
+
+def _percentile(values: list[int], p: int) -> float:
+    """Return the p-th percentile of a sorted integer list (linear interpolation)."""
+    if not values:
+        return 0.0
+    sv = sorted(values)
+    idx = (len(sv) - 1) * p / 100
+    lo, hi = int(idx), min(int(idx) + 1, len(sv) - 1)
+    return sv[lo] + (sv[hi] - sv[lo]) * (idx - lo)
+
 # Rough bytes-per-line by language for LOC estimation
 _BYTES_PER_LINE: dict[str, int] = {
     "python": 45, "ruby": 42, "go": 45, "javascript": 40, "typescript": 45,
@@ -102,23 +112,49 @@ class StatsFetcher:
         return stats
 
     def _fetch_commits(self, project_slug: str, repo) -> int:
-        """Fetch recent commits and upsert into project_commits table. Returns row count inserted."""
+        """
+        Fetch recent commits, store per-commit additions/deletions, and compute contributor stats.
+        Returns row count processed. additions/deletions require one extra API call per new commit;
+        stops fetching them gracefully if the rate limit is hit.
+        """
         since = datetime.utcnow() - timedelta(days=_COMMIT_LOOKBACK_DAYS)
         commits = repo.get_commits(since=since)  # raises on API failure — caller handles
+
+        # SHAs already stored with non-null additions — skip extra API call for these
+        conn = sqlite3.connect(self.registry.db_path)
+        existing_with_stats = {
+            row[0] for row in conn.execute(
+                "SELECT sha FROM project_commits WHERE project_slug = ? AND additions IS NOT NULL",
+                (project_slug,),
+            ).fetchall()
+        }
+        conn.close()
+
         rows = []
+        fetch_diff_stats = True  # flipped to False on rate limit
         for c in commits:
             commit = c.commit
             author = commit.author
             if author and author.date:
                 d = author.date
-                # Normalize to timezone-naive UTC so all stored values are consistent
                 if d.tzinfo is not None:
                     d = d.astimezone(timezone.utc).replace(tzinfo=None)
                 committed_at = d.isoformat()
             else:
                 committed_at = ""
             if not committed_at:
-                continue  # skip commits with no date — they break date-based queries
+                continue
+
+            additions = deletions = None
+            if fetch_diff_stats and c.sha not in existing_with_stats:
+                try:
+                    additions = c.stats.additions
+                    deletions = c.stats.deletions
+                except Exception as exc:
+                    # Stop fetching diff stats if rate-limited; other errors are per-commit noise
+                    if "rate limit" in str(exc).lower():
+                        fetch_diff_stats = False
+
             rows.append((
                 project_slug,
                 c.sha,
@@ -126,19 +162,83 @@ class StatsFetcher:
                 author.name if author else "",
                 author.email if author else "",
                 committed_at,
+                additions,
+                deletions,
             ))
+
         if not rows:
             return 0
+
         conn = sqlite3.connect(self.registry.db_path)
+        # Use ON CONFLICT DO UPDATE so additions/deletions get backfilled for rows already stored
         conn.executemany(
-            """INSERT OR IGNORE INTO project_commits
-               (project_slug, sha, message, author_name, author_email, committed_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO project_commits
+               (project_slug, sha, message, author_name, author_email, committed_at,
+                additions, deletions)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(project_slug, sha) DO UPDATE SET
+                 additions = COALESCE(excluded.additions, project_commits.additions),
+                 deletions = COALESCE(excluded.deletions, project_commits.deletions)""",
             rows,
         )
         conn.commit()
         conn.close()
+
+        self._compute_contributor_stats(project_slug)
         return len(rows)
+
+    def _compute_contributor_stats(self, project_slug: str) -> None:
+        """
+        Aggregate per-author commits/additions/deletions for 30d and 90d windows
+        and classify each contributor into a tier (core / regular / occasional).
+        Tiers are relative to the project's own distribution, not a global threshold.
+        """
+        now = datetime.utcnow()
+        for days in (30, 90):
+            cutoff = (now - timedelta(days=days)).isoformat()
+            period_start = (now - timedelta(days=days)).date().isoformat()
+            period_end = now.date().isoformat()
+
+            conn = sqlite3.connect(self.registry.db_path)
+            raw = conn.execute(
+                """SELECT author_email, author_name,
+                          COUNT(*) AS commits,
+                          COALESCE(SUM(additions), 0) AS additions,
+                          COALESCE(SUM(deletions), 0) AS deletions
+                   FROM project_commits
+                   WHERE project_slug = ? AND committed_at >= ?
+                   GROUP BY author_email
+                   ORDER BY commits DESC""",
+                (project_slug, cutoff),
+            ).fetchall()
+            conn.close()
+
+            if not raw:
+                continue
+
+            commit_counts = [r[2] for r in raw]
+            p75 = _percentile(commit_counts, 75)
+            p25 = _percentile(commit_counts, 25)
+
+            stat_rows = []
+            for email, name, commits, additions, deletions in raw:
+                if commits >= p75:
+                    tier = "core"
+                elif commits >= p25:
+                    tier = "regular"
+                else:
+                    tier = "occasional"
+                stat_rows.append({
+                    "period_start": period_start,
+                    "period_end": period_end,
+                    "author_email": email or "",
+                    "author_name": name or "",
+                    "commits": commits,
+                    "additions": additions,
+                    "deletions": deletions,
+                    "tier": tier,
+                })
+            self.registry.upsert_contributor_stats(project_slug, stat_rows)
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

@@ -11,7 +11,9 @@ import yaml
 class QueryIntent(str, Enum):
     STATISTICAL = "statistical"
     COMPARISON = "comparison"
+    INTEGRATION = "integration"
     HEALTH = "health"
+    CODE_INVENTORY = "code_inventory"
     CODE_SEARCH = "code_search"
     CONCEPTUAL = "conceptual"
     GENERAL = "general"
@@ -34,7 +36,7 @@ class QueryProcessor:
 
     def classify(self, query: str) -> QueryIntent:
         q = query.lower()
-        priority_order = ["comparison", "statistical", "health", "code_search", "conceptual"]
+        priority_order = ["integration", "comparison", "statistical", "code_inventory", "health", "code_search", "conceptual"]
         for intent_name in priority_order:
             rule = self._rules.get(intent_name, {})
             for pattern in rule.get("patterns", []):

@@ -10,8 +10,8 @@ class CodeAgent(BaseExplorerAgent):
         return code_agent_system_prompt()
 
     def tools(self) -> list:
-        from explorer.agents.tools import vector_search
-        return [vector_search]
+        from explorer.agents.tools import vector_search, query_code_symbols, get_symbol_detail
+        return [vector_search, query_code_symbols, get_symbol_detail]
 
     def handle(self, query: str, project_slug: str | None = None, **kwargs) -> str:
         slug = project_slug or self._infer_project_slug(query)

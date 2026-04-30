@@ -92,9 +92,9 @@ async def stars_chart(slug: str) -> dict:
 
 @router.get("/{slug}/charts/commits")
 async def commits_chart(slug: str) -> dict:
-    """Return Plotly figure JSON for the commit-activity chart."""
-    from explorer.dashboard.graphs import commits_over_time_plotly
-    fig = commits_over_time_plotly(slug)
+    """Return Plotly figure JSON for weekly commit activity (last 13 weeks)."""
+    from explorer.dashboard.graphs import weekly_commits_plotly
+    fig = weekly_commits_plotly(slug)
     return json.loads(fig.to_json())
 
 

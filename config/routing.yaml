@@ -24,6 +24,18 @@ intent_patterns:
       - "activity (over|in|last|this)"
       - "weekly|monthly (commits|activity|contributions)"
 
+  integration:
+    priority: HIGH
+    description: Ecosystem fit, interoperability, and cross-project integration
+    patterns:
+      - '(work|use|integrate|combine|connect) .+ (with|and|together)'
+      - '(compatible|interoperable|plug.?in).*(with|for)'
+      - 'use .+ alongside'
+      - '(stack|pipeline|workflow).+(using|with).+and'
+      - '(can|does|will) .+ (work|integrate|connect|talk) (with|to|alongside)'
+      - '(together|side.by.side|in tandem)'
+      - '(interop|integration).+(between|of)'
+
   comparison:
     priority: HIGH
     description: Side-by-side comparison of two or more projects
@@ -52,6 +64,20 @@ intent_patterns:
       - "response time (for )?(issues?|prs?|pull requests?)"
       - "last (active|activity|commit|update)"
       - "abandoned|archived|dead"
+
+  code_inventory:
+    priority: HIGH
+    description: Structural questions about classes, methods, functions, signatures
+    patterns:
+      - 'how many (class\w*|method\w*|function\w*|interface\w*)'
+      - 'list (all )?(class\w*|method\w*|function\w*|interface\w*)'
+      - 'what class\w* (are|exist|does .+ have)'
+      - 'show (me )?(all |the )?(class\w*|method\w*|function\w*|api surface|public interface|public api)'
+      - 'signature (of|for) .+'
+      - 'what (does|is) (the )?(\w+\.)?\w+ (class|method|function|interface) (do|return|take)'
+      - '(class|method|function|interface) (called|named) .+'
+      - 'count (class\w*|method\w*|function\w*)'
+      - 'find (class|method|function) .+'
 
   code_search:
     priority: NORMAL

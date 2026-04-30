@@ -34,6 +34,7 @@ _AGENT_OFFSETS: dict[str, int] = {
     "docs": 3,
     "health": 4,
     "compare": 5,
+    "integration": 6,
 }
 
 
@@ -228,9 +229,92 @@ def _compare_server() -> Server:
                        description="Side-by-side analysis of two or more indexed projects"),
         ],
     )
-    def compare_fn(message: Message) -> str:
+    async def compare_fn(message: Message, context: RunContext) -> AsyncGenerator:
         from explorer.agents.compare_agent import CompareAgent
-        return CompareAgent().handle(_text(message))
+        query = _text(message)
+        agent = CompareAgent()
+        slugs = agent._infer_all_project_slugs(query)
+
+        if len(slugs) < 2:
+            try:
+                from explorer.registry import ProjectRegistry
+                available = ", ".join(p.slug for p in ProjectRegistry().list_all())
+            except Exception:
+                available = "unknown"
+            reply: Message = yield TaskStatus(
+                state=TaskState.input_required,
+                message=Message(
+                    role="agent",
+                    parts=[Part(root=TextPart(text=(
+                        f"Which two projects would you like to compare? "
+                        f"Available: {available}. "
+                        "Reply with both project names, e.g. 'compare egeria and agentstack'."
+                    )))],
+                    messageId=str(uuid4()),
+                    taskId=context.task_id,
+                    contextId=context.context_id,
+                ),
+            )
+            if reply:
+                for s in agent._infer_all_project_slugs(_text(reply)):
+                    if s not in slugs:
+                        slugs.append(s)
+
+        # Build a query that includes resolved slugs so CompareAgent can find them
+        combined = (" ".join(slugs) + " " + query) if slugs else query
+        yield agent.handle(combined)
+
+    return server
+
+
+def _integration_server() -> Server:
+    server = Server()
+
+    @server.agent(
+        name="Project Explorer: Integration",
+        description=(
+            "Answers 'how do X and Y work together?' questions across two or more LF AI projects. "
+            "Checks for shared contributors, explicit integration docs, compatible interfaces, "
+            "and complementary feature sets. Name both projects in the question."
+        ),
+        skills=[
+            AgentSkill(id="integration_analysis", name="Integration Analysis",
+                       description="Ecosystem fit, shared contributors, and cross-project integration guidance"),
+        ],
+    )
+    async def integration_fn(message: Message, context: RunContext) -> AsyncGenerator:
+        from explorer.agents.integration_agent import IntegrationAgent
+        query = _text(message)
+        agent = IntegrationAgent()
+        slugs = agent._infer_all_project_slugs(query)
+
+        if len(slugs) < 2:
+            try:
+                from explorer.registry import ProjectRegistry
+                available = ", ".join(p.slug for p in ProjectRegistry().list_all())
+            except Exception:
+                available = "unknown"
+            reply: Message = yield TaskStatus(
+                state=TaskState.input_required,
+                message=Message(
+                    role="agent",
+                    parts=[Part(root=TextPart(text=(
+                        f"Which two projects should I check for integration? "
+                        f"Available: {available}. "
+                        "Reply with both project names, e.g. 'egeria and agentstack'."
+                    )))],
+                    messageId=str(uuid4()),
+                    taskId=context.task_id,
+                    contextId=context.context_id,
+                ),
+            )
+            if reply:
+                for s in agent._infer_all_project_slugs(_text(reply)):
+                    if s not in slugs:
+                        slugs.append(s)
+
+        combined = (" ".join(slugs) + " " + query) if slugs else query
+        yield agent.handle(combined)
 
     return server
 
@@ -256,6 +340,8 @@ def _orchestrator_server(agent_ports: dict[str, int]) -> Server:
                        description=f"Delegates to health agent — port {agent_ports.get('health', 8084)}"),
             AgentSkill(id="compare", name="Compare",
                        description=f"Delegates to compare agent — port {agent_ports.get('compare', 8085)}"),
+            AgentSkill(id="integration", name="Integration",
+                       description=f"Delegates to integration agent — port {agent_ports.get('integration', 8086)}"),
             AgentSkill(id="general", name="General RAG",
                        description="General-purpose RAG across all indexed content"),
         ],
@@ -280,6 +366,7 @@ async def _serve_all(host: str, base_port: int) -> None:
         _docs_server(),
         _health_server(),
         _compare_server(),
+        _integration_server(),
     ]
     print(f"Starting {len(servers)} agents:")
     for name, offset in _AGENT_OFFSETS.items():

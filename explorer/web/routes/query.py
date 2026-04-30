@@ -80,7 +80,7 @@ def _pick_chart(query: str, intent: str, project_slug: str) -> dict | None:
         if intent == "comparison":
             # Extract slugs from the query for a cross-project stats chart
             from explorer.agents.compare_agent import CompareAgent
-            slugs = CompareAgent()._extract_project_slugs(query)
+            slugs = CompareAgent()._infer_all_project_slugs(query)
             if len(slugs) >= 2:
                 fig = graphs.compare_stats_plotly(slugs)
             else:
@@ -181,13 +181,23 @@ async def stream(request: QueryRequest) -> StreamingResponse:
                 chart = _pick_chart(
                     request.query, item.get("intent", ""), request.project_slug or ""
                 )
-                yield _sse({
+                intent_val = item.get("intent", "")
+                done: dict = {
                     "t": "done",
-                    "intent": item.get("intent", ""),
+                    "intent": intent_val,
                     "hash": item.get("hash", ""),
                     "cached": item.get("cached", False),
                     "chart": chart,
-                })
+                }
+                # Structured symbol table for code_inventory queries
+                if intent_val == "code_inventory" and request.project_slug:
+                    done["symbol_table"] = _code_inventory_table(request.query, request.project_slug)
+                # Suggest an alias when no project was resolved but a fuzzy match exists
+                if not request.project_slug:
+                    alias_hint = _fuzzy_alias_suggestion(request.query)
+                    if alias_hint:
+                        done["alias_suggestion"] = alias_hint
+                yield _sse(done)
             else:
                 yield _sse({"t": "chunk", "v": str(item)})
 
@@ -199,3 +209,103 @@ async def feedback(request: FeedbackRequest) -> dict:
     from explorer.observability.metrics_collector import MetricsCollector
     MetricsCollector().record_feedback(request.query_hash, request.vote)
     return {"recorded": True}
+
+
+def _code_inventory_table(query: str, project_slug: str) -> dict | None:
+    """
+    Build a structured symbol table payload for code_inventory done events.
+    Extracts kind hint from query, returns top 30 matching symbols.
+    """
+    import re
+    import sqlite3
+    try:
+        from explorer.registry import ProjectRegistry
+        registry = ProjectRegistry()
+        slug = registry._normalize_slug(project_slug)
+
+        q = query.lower()
+        kind = "all"
+        for k in ("class", "method", "function", "interface", "enum"):
+            if k in q:
+                kind = k
+                break
+
+        # Pattern hint: word after "named", "called", or after "show.*<kind>"
+        pattern = ""
+        m = re.search(r'(?:named?|called?)\s+(\w+)', q)
+        if m:
+            pattern = m.group(1)
+
+        conn = sqlite3.connect(registry.db_path)
+        conn.row_factory = sqlite3.Row
+        filters = ["project_slug = ?"]
+        params: list = [slug]
+        if kind != "all":
+            filters.append("kind = ?")
+            params.append(kind)
+        if pattern:
+            filters.append("name LIKE ?")
+            params.append(f"%{pattern}%")
+        where = " AND ".join(filters)
+        rows = conn.execute(
+            f"SELECT kind, name, qualified_name, signature, docstring, file_path, start_line "  # noqa: S608
+            f"FROM project_code_symbols WHERE {where} ORDER BY file_path, start_line LIMIT 30",
+            params,
+        ).fetchall()
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM project_code_symbols WHERE {where}",  # noqa: S608
+            params,
+        ).fetchone()[0]
+        conn.close()
+
+        if not rows:
+            return None
+        return {
+            "kind": kind,
+            "project": slug,
+            "total": total,
+            "items": [
+                {
+                    "kind": r["kind"],
+                    "name": r["qualified_name"],
+                    "signature": r["signature"] or "",
+                    "doc": (r["docstring"] or "")[:80],
+                    "file": r["file_path"],
+                    "line": r["start_line"],
+                }
+                for r in rows
+            ],
+        }
+    except Exception:
+        return None
+
+
+def _fuzzy_alias_suggestion(query: str) -> dict | None:
+    """
+    Return {term, candidate_slug, candidate_name} if a fuzzy match exists for the query
+    but is not already an exact slug/alias match. Returns None otherwise.
+    """
+    try:
+        from explorer.registry import ProjectRegistry
+        from explorer.agents.base import BaseExplorerAgent
+
+        registry = ProjectRegistry()
+        # Skip if query already resolves exactly
+        class _Probe(BaseExplorerAgent):
+            def system_prompt(self): return ""
+            def tools(self): return []
+            def handle(self, *a, **kw): return ""
+        if _Probe()._infer_project_slug(query):
+            return None
+        result = registry.fuzzy_candidate(query)
+        if not result:
+            return None
+        term, slug = result
+        project = registry.get(slug)
+        return {
+            "term": term,
+            "candidate_slug": slug,
+            "candidate_name": project.display_name if project else slug,
+        }
+    except Exception:
+        return None

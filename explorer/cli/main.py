@@ -1,6 +1,17 @@
 """CLI entry point — all project-explorer commands."""
 from __future__ import annotations
 
+import os
+
+# Suppress gRPC fork warnings, HuggingFace progress bars, and tokenizer parallelism
+# noise that pollutes normal CLI output. Set DEBUG=1 to restore verbose logging.
+if not os.environ.get("DEBUG"):
+    os.environ.setdefault("GRPC_VERBOSITY", "NONE")
+    os.environ.setdefault("GLOG_minloglevel", "3")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("TQDM_DISABLE", "1")
+
 from typing import Optional
 
 import typer
@@ -68,6 +79,11 @@ def ask(
     import hashlib
     from explorer.rag_system import RAGSystem
     from explorer.observability.feedback_collector import FeedbackCollector
+
+    # When no explicit project is given, check for a fuzzy alias match
+    if not project:
+        project = _maybe_resolve_alias(query)
+
     system = RAGSystem()
     response = system.query(query, project_slug=project)
     console.print(response)
@@ -164,6 +180,11 @@ def _ingest_web_docs(project, docs_url: str, registry) -> None:
 def refresh(
     slug: str = typer.Argument(help="Project slug to re-index"),
     no_stats: bool = typer.Option(False, "--no-stats", help="Skip GitHub statistics update"),
+    symbols: bool = typer.Option(
+        False, "--symbols",
+        help="Extract (or re-extract) code symbols (classes, methods, functions) from source files. "
+             "Use this once after upgrading to populate the symbol index for existing projects.",
+    ),
 ):
     """Incrementally re-index a project and refresh GitHub statistics."""
     from explorer.ingestion.incremental import IncrementalIndexer
@@ -178,6 +199,19 @@ def refresh(
     dropped = QueryCache().invalidate_project(slug)
     if dropped:
         console.print(f"[dim]Cleared {dropped} cached query result(s) for '{slug}'.[/dim]")
+    if symbols:
+        console.print("[dim]Extracting code symbols...[/dim]")
+        try:
+            from explorer.ingestion.pipeline import IngestionPipeline
+            count = IngestionPipeline().extract_symbols_only(
+                slug, project.github_url, project.collections or []
+            )
+            if count:
+                console.print(f"[green]Extracted {count} symbols.[/green]")
+            else:
+                console.print("[yellow]No code collections found — nothing extracted.[/yellow]")
+        except Exception as exc:
+            console.print(f"[yellow]Symbol extraction failed: {exc}[/yellow]")
     if not no_stats:
         console.print("[dim]Refreshing project statistics...[/dim]")
         try:
@@ -245,6 +279,83 @@ def serve(
     else:
         console.print(f"[cyan]Starting Project Explorer orchestrator on {host}:{port}[/cyan]")
     agentstack_run(host=host, port=port, all_agents=all_agents)
+
+
+def _maybe_resolve_alias(query: str) -> Optional[str]:
+    """
+    Check for a fuzzy alias candidate before running a query.
+    If found, prompt the user to confirm. If confirmed, saves the alias and returns the slug.
+    """
+    try:
+        from explorer.registry import ProjectRegistry
+        registry = ProjectRegistry()
+        result = registry.fuzzy_candidate(query)
+        if not result:
+            return None
+        term, slug = result
+        project = registry.get(slug)
+        display = project.display_name if project else slug
+        confirmed = typer.confirm(
+            f'Did you mean "{display}"? Remember "{term}" as an alias for {slug}?',
+            default=False,
+        )
+        if confirmed:
+            registry.add_alias(term, slug)
+            return slug
+    except Exception:
+        pass
+    return None
+
+
+# ── aliases sub-group ─────────────────────────────────────────────────────────
+
+aliases_app = typer.Typer(name="aliases", help="Manage project name aliases.")
+app.add_typer(aliases_app)
+
+
+@aliases_app.command(name="list")
+def aliases_list(
+    slug: Optional[str] = typer.Argument(None, help="Project slug (omit to list all)"),
+):
+    """List stored aliases, optionally filtered to one project."""
+    from explorer.registry import ProjectRegistry
+    rows = ProjectRegistry().list_aliases(slug)
+    if not rows:
+        console.print("[dim]No aliases found.[/dim]")
+        return
+    from rich.table import Table
+    tbl = Table("Alias", "Project", "Source", "Created")
+    for r in rows:
+        tbl.add_row(r["alias"], r["project_slug"], r["confirmed_by"], r["created_at"][:10])
+    console.print(tbl)
+
+
+@aliases_app.command(name="add")
+def aliases_add(
+    alias: str = typer.Argument(help='Alias phrase, e.g. "Egeria Platform"'),
+    slug: str = typer.Argument(help="Project slug to map to"),
+):
+    """Add a name alias for a project."""
+    from explorer.registry import ProjectRegistry
+    registry = ProjectRegistry()
+    if not registry.exists(slug):
+        console.print(f"[red]Project '{slug}' not found.[/red]")
+        raise typer.Exit(1)
+    registry.add_alias(alias, slug)
+    console.print(f'[green]Alias "{alias}" → {slug} saved.[/green]')
+
+
+@aliases_app.command(name="remove")
+def aliases_remove(
+    alias: str = typer.Argument(help="Alias to remove"),
+):
+    """Remove a stored alias."""
+    from explorer.registry import ProjectRegistry
+    removed = ProjectRegistry().remove_alias(alias)
+    if removed:
+        console.print(f'[green]Alias "{alias}" removed.[/green]')
+    else:
+        console.print(f'[yellow]Alias "{alias}" not found.[/yellow]')
 
 
 if __name__ == "__main__":

@@ -471,16 +471,21 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
     ex.submit(lambda: asyncio.run(_add_to_memory())).result(timeout=5)
 ```
 
-**3. Pre-warming to avoid threading conflicts.** PyTorch and gRPC initialize file descriptors in the main thread. If they initialize inside a Textual worker thread, FD conflicts occur. The `run()` entry point forces model and client initialization in the main thread before Textual starts:
+**3. Pre-warming to avoid threading conflicts.** PyTorch and gRPC initialize file descriptors in the main thread. If they initialize inside a Textual worker thread, FD conflicts occur. The `run()` entry point forces model and client initialization in the main thread before Textual starts. Each step is individually fault-tolerant — a missing model or unreachable Milvus does not prevent the TUI from launching; errors surface inline when a query is submitted:
 
 ```python
 def run() -> None:
-    get_embedding_model()   # force SentenceTransformer init in main thread
-    rag = RAGSystem()
+    try:
+        get_embedding_model()   # force SentenceTransformer init in main thread
+    except Exception:
+        pass
+
     try:
         MultiCollectionStore()._get_client()  # force Milvus client init
     except Exception:
         pass
+
+    rag = RAGSystem()           # lightweight wrapper; connections happen lazily
     conv = ConversationAgent(rag_system=rag)
     ProjectExplorerApp(conv, rag).run()
 ```
@@ -573,6 +578,10 @@ elif any(w in q for w in ("week", "weekly", "per week", "week-by-week")):
 ```
 
 The chart appears inline in the chat response — not just in the sidebar — so the answer and its visualization arrive together.
+
+`weekly_commits_plotly` is also the source for the sidebar **Commits** tab. The original implementation used `commits_over_time_plotly`, which reads from `project_stats` snapshot rows. With only one snapshot (the common case after a fresh add), it produces a single bar chart that looks flat and carries no trend information. Switching the endpoint to `weekly_commits_plotly` gives 13 weeks of granular data from the first refresh forward.
+
+All bar and line charts now include `yaxis_rangemode="tozero"` in their Plotly layout. Without this, Plotly auto-scales the y-axis to the data range — a chart showing 5000 stars might span 4999–5001, making the line appear flat against the bottom of the frame. Pinning the range to zero makes magnitude visible at a glance.
 
 ---
 
@@ -815,9 +824,22 @@ LLMs will describe how to accomplish a task if they don't have a tool to accompl
 
 Per-file incremental updates require tracking chunk-to-source-file mappings and supporting efficient delete-by-metadata in the vector store. Collection-level invalidation is simpler: detect which collection types were touched by changed files, drop those collections, re-ingest. For typical repos and change frequencies, collection-level granularity is fast enough.
 
+### Suppress Library Noise Early and Explicitly
+
+gRPC, HuggingFace transformers, and tqdm all print to stderr in ways that pollute CLI output and break TUI alternate-screen mode. Suppress them with environment variables at module load time — before any lazy import can pull in the libraries. Use `setdefault` so that a developer who sets `DEBUG=1` (or any of the individual vars) always wins:
+
+```python
+if not os.environ.get("DEBUG"):
+    os.environ.setdefault("GRPC_VERBOSITY", "NONE")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("TQDM_DISABLE", "1")
+```
+
+This is one of those things that seems obvious in retrospect but causes a lot of confusion in testing — "why is the TUI printing 'Loading weights: 100%' to the screen?".
+
 ### Pre-Warm Heavy Dependencies in the Main Thread
 
-PyTorch, gRPC (Milvus), and BeeAI all initialize global state (file descriptors, thread pools, event loops) when first used. If they initialize inside a framework thread (Textual worker, FastAPI startup), race conditions and FD conflicts occur. Force initialization in the main thread before starting any framework.
+PyTorch, gRPC (Milvus), and BeeAI all initialize global state (file descriptors, thread pools, event loops) when first used. If they initialize inside a framework thread (Textual worker, FastAPI startup), race conditions and FD conflicts occur. Force initialization in the main thread before starting any framework. Make each pre-warm step individually fault-tolerant — a failed model download should not prevent the TUI from launching.
 
 ### Observability Must Be Non-Blocking and Failure-Tolerant
 
@@ -863,7 +885,8 @@ The natural next extensions, roughly in order of impact:
 1. **Evaluation harness** — build a test set of (query, expected intent, expected answer) triples and measure retrieval recall, answer correctness, and latency regression automatically
 2. **Feedback-driven reranking** — the `MultiCollectionStore` already records feedback scores; train a lightweight reranker on thumbs-up/down signals to boost relevant chunks
 3. **More collection types** — GitHub Issues, PR bodies, and discussion threads are high-signal content not yet indexed
-4. **Cross-project ConversationAgent** — today the conversation agent scopes to one project; a true cross-project agent would call `vector_search` across all indexed projects simultaneously
+4. **Comparison and integration queries** — multi-project `CompareAgent` that diffs stats and runs `vector_search` across multiple projects simultaneously; `_infer_all_project_slugs()` to extract multiple slugs from one query. See [comparison-integration-approach.md](comparison-integration-approach.md) for the full design.
+5. **Code intelligence / symbol extraction** — AST-based extraction of classes, methods, and function signatures into a `project_code_symbols` SQLite table during ingestion; new `query_code_symbols` and `get_symbol_detail` tools; `code_inventory` intent for structural queries like "list all classes" and "show the signature of X". See [code-intelligence-approach.md](code-intelligence-approach.md).
 5. **Async ingestion** — the `add` command blocks until ingestion completes; move it to a background job with progress polling via the web API
 6. **Milvus HNSW index** — when collection sizes exceed ~100k chunks, switch from FLAT to HNSW for sub-linear search time
 

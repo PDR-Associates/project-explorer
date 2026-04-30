@@ -378,20 +378,26 @@ def run() -> None:
     Textual starts. This prevents gRPC/PyTorch FD conflicts that occur when
     those libraries initialise inside a worker thread.
     """
+    import sys
     from explorer.rag_system import RAGSystem
-    from explorer.embeddings import get_embedding_model
     from explorer.agents.conversation_agent import ConversationAgent
 
-    # Force model + Milvus client init now, in the main thread
-    get_embedding_model()
-    rag = RAGSystem()
+    # Pre-warm embedding model in the main thread — best-effort, non-fatal.
+    try:
+        from explorer.embeddings import get_embedding_model
+        get_embedding_model()
+    except Exception as exc:
+        print(f"[warn] Could not pre-warm embeddings: {exc}", file=sys.stderr)
+
+    # Pre-warm Milvus client — best-effort, non-fatal.
     try:
         from explorer.multi_collection_store import MultiCollectionStore
         MultiCollectionStore()._get_client()
     except Exception:
         pass
 
-    # Create the ConversationAgent with the pre-warmed RAGSystem as its fallback.
+    rag = RAGSystem()
+
     # _get_agent() is called lazily on first query so BeeAI init stays in the
     # worker thread (avoids asyncio loop conflicts with Textual's event loop).
     conv = ConversationAgent(rag_system=rag)

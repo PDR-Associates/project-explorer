@@ -62,6 +62,10 @@ class RAGSystem:
             from explorer.agents.stats_agent import StatsAgent
             return StatsAgent().handle(query, project_slug), []
 
+        if intent == QueryIntent.INTEGRATION:
+            from explorer.agents.integration_agent import IntegrationAgent
+            return IntegrationAgent().handle(query, project_slug), []
+
         if intent == QueryIntent.COMPARISON:
             from explorer.agents.compare_agent import CompareAgent
             return CompareAgent().handle(query, project_slug), []
@@ -69,6 +73,10 @@ class RAGSystem:
         if intent == QueryIntent.HEALTH:
             from explorer.agents.health_agent import HealthAgent
             return HealthAgent().handle(query, project_slug), []
+
+        if intent == QueryIntent.CODE_INVENTORY:
+            from explorer.agents.code_agent import CodeAgent
+            return CodeAgent().handle(query, project_slug), []
 
         if intent == QueryIntent.CODE_SEARCH:
             from explorer.agents.code_agent import CodeAgent

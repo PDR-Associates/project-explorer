@@ -128,6 +128,69 @@ class ProjectRegistry:
                     FOREIGN KEY (project_slug) REFERENCES projects(slug)
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS project_code_symbols (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_slug   TEXT NOT NULL,
+                    file_path      TEXT NOT NULL,
+                    language       TEXT NOT NULL,
+                    kind           TEXT NOT NULL,
+                    name           TEXT NOT NULL,
+                    qualified_name TEXT NOT NULL,
+                    signature      TEXT DEFAULT '',
+                    docstring      TEXT DEFAULT '',
+                    summary        TEXT DEFAULT '',
+                    start_line     INTEGER DEFAULT 0,
+                    end_line       INTEGER DEFAULT 0,
+                    UNIQUE(project_slug, file_path, qualified_name),
+                    FOREIGN KEY (project_slug) REFERENCES projects(slug)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbols_slug_kind "
+                "ON project_code_symbols(project_slug, kind)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbols_name "
+                "ON project_code_symbols(project_slug, name)"
+            )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS project_aliases (
+                    alias        TEXT PRIMARY KEY,
+                    project_slug TEXT NOT NULL,
+                    confirmed_by TEXT DEFAULT 'user',
+                    created_at   TEXT NOT NULL,
+                    FOREIGN KEY (project_slug) REFERENCES projects(slug)
+                )
+            """)
+            # Migrations: add additions / deletions to existing project_commits rows
+            existing_commits = {r[1] for r in conn.execute("PRAGMA table_info(project_commits)")}
+            for col, defn in [
+                ("additions", "INTEGER DEFAULT NULL"),
+                ("deletions", "INTEGER DEFAULT NULL"),
+            ]:
+                if col not in existing_commits:
+                    conn.execute(f"ALTER TABLE project_commits ADD COLUMN {col} {defn}")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS project_contributor_stats (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_slug  TEXT NOT NULL,
+                    period_start  TEXT NOT NULL,
+                    period_end    TEXT NOT NULL,
+                    author_email  TEXT NOT NULL,
+                    author_name   TEXT NOT NULL,
+                    commits       INTEGER DEFAULT 0,
+                    additions     INTEGER DEFAULT 0,
+                    deletions     INTEGER DEFAULT 0,
+                    tier          TEXT DEFAULT '',
+                    UNIQUE(project_slug, period_start, period_end, author_email),
+                    FOREIGN KEY (project_slug) REFERENCES projects(slug)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_contributor_stats_slug "
+                "ON project_contributor_stats(project_slug, period_start)"
+            )
 
     def add(self, project: Project) -> None:
         data = {**asdict(project), "collections": json.dumps(project.collections)}
@@ -182,12 +245,146 @@ class ProjectRegistry:
                 (sha, slug),
             )
 
+    def upsert_code_symbols(self, project_slug: str, symbols: list) -> None:
+        """Insert or replace extracted code symbols. symbols is a list of CodeSymbol dataclasses."""
+        if not symbols:
+            return
+        slug = self._normalize_slug(project_slug)
+        rows = [
+            (slug, s.file_path, s.language, s.kind, s.name,
+             s.qualified_name, s.signature, s.docstring, "", s.start_line, s.end_line)
+            for s in symbols
+        ]
+        with self._conn() as conn:
+            conn.executemany(
+                """INSERT INTO project_code_symbols
+                   (project_slug, file_path, language, kind, name, qualified_name,
+                    signature, docstring, summary, start_line, end_line)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(project_slug, file_path, qualified_name)
+                   DO UPDATE SET
+                     language=excluded.language, kind=excluded.kind, name=excluded.name,
+                     signature=excluded.signature, docstring=excluded.docstring,
+                     start_line=excluded.start_line, end_line=excluded.end_line""",
+                rows,
+            )
+
+    def clear_code_symbols(self, project_slug: str, language: str | None = None) -> None:
+        """Remove symbol entries for a project, optionally filtered by language."""
+        slug = self._normalize_slug(project_slug)
+        with self._conn() as conn:
+            if language:
+                conn.execute(
+                    "DELETE FROM project_code_symbols WHERE project_slug = ? AND language = ?",
+                    (slug, language),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM project_code_symbols WHERE project_slug = ?", (slug,)
+                )
+
+    def upsert_contributor_stats(self, project_slug: str, rows: list[dict]) -> None:
+        """Insert or replace aggregated per-contributor stats for a time period."""
+        if not rows:
+            return
+        slug = self._normalize_slug(project_slug)
+        with self._conn() as conn:
+            conn.executemany(
+                """INSERT INTO project_contributor_stats
+                   (project_slug, period_start, period_end, author_email, author_name,
+                    commits, additions, deletions, tier)
+                   VALUES (:project_slug, :period_start, :period_end, :author_email, :author_name,
+                           :commits, :additions, :deletions, :tier)
+                   ON CONFLICT(project_slug, period_start, period_end, author_email)
+                   DO UPDATE SET
+                     author_name=excluded.author_name,
+                     commits=excluded.commits,
+                     additions=excluded.additions,
+                     deletions=excluded.deletions,
+                     tier=excluded.tier""",
+                [{**r, "project_slug": slug} for r in rows],
+            )
+
     def remove(self, slug: str) -> None:
         normalized = self._normalize_slug(slug)
         with self._conn() as conn:
             conn.execute("DELETE FROM projects WHERE slug = ?", (normalized,))
             conn.execute("DELETE FROM project_stats WHERE project_slug = ?", (normalized,))
             conn.execute("DELETE FROM project_commits WHERE project_slug = ?", (normalized,))
+            conn.execute("DELETE FROM project_code_symbols WHERE project_slug = ?", (normalized,))
+            conn.execute("DELETE FROM project_aliases WHERE project_slug = ?", (normalized,))
+            conn.execute("DELETE FROM project_contributor_stats WHERE project_slug = ?", (normalized,))
+
+    # ── alias management ──────────────────────────────────────────────────────
+
+    def add_alias(self, alias: str, slug: str, confirmed_by: str = "user") -> None:
+        """Store an alias → slug mapping. Alias is normalized (lowercase, spaces→underscores)."""
+        normalized = alias.lower().replace(" ", "_").replace("-", "_")
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO project_aliases (alias, project_slug, confirmed_by, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (normalized, self._normalize_slug(slug), confirmed_by, datetime.utcnow().isoformat()),
+            )
+
+    def remove_alias(self, alias: str) -> bool:
+        """Delete an alias. Returns True if a row was deleted."""
+        normalized = alias.lower().replace(" ", "_").replace("-", "_")
+        with self._conn() as conn:
+            cursor = conn.execute("DELETE FROM project_aliases WHERE alias = ?", (normalized,))
+            return cursor.rowcount > 0
+
+    def resolve_alias(self, term: str) -> str | None:
+        """Look up a term in the alias table; return the project slug or None."""
+        normalized = term.lower().replace(" ", "_").replace("-", "_")
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT project_slug FROM project_aliases WHERE alias = ?", (normalized,)
+            ).fetchone()
+        return row["project_slug"] if row else None
+
+    def list_aliases(self, slug: str | None = None) -> list[dict]:
+        """Return all aliases, optionally filtered to a single project."""
+        with self._conn() as conn:
+            if slug:
+                rows = conn.execute(
+                    "SELECT alias, project_slug, confirmed_by, created_at FROM project_aliases "
+                    "WHERE project_slug = ? ORDER BY alias",
+                    (self._normalize_slug(slug),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT alias, project_slug, confirmed_by, created_at FROM project_aliases "
+                    "ORDER BY project_slug, alias"
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def fuzzy_candidate(self, query: str) -> tuple[str, str] | None:
+        """
+        Return (display_term, project_slug) if a phrase in the query fuzzy-matches a project.
+        Uses difflib at 0.70 cutoff. Tries 1–4-word ngrams ordered longest-first.
+        Returns None when no confident match exists.
+        """
+        import difflib
+        q = query.lower()
+        projects = self.list_all()
+        candidates: dict[str, str] = {}  # normalized_name → slug
+        for p in projects:
+            candidates[p.slug.lower()] = p.slug
+            if p.display_name:
+                key = p.display_name.lower().replace("-", "_").replace(" ", "_")
+                candidates[key] = p.slug
+        if not candidates:
+            return None
+        words = q.split()
+        for n in range(min(4, len(words)), 0, -1):
+            for i in range(len(words) - n + 1):
+                term = "_".join(words[i:i + n])
+                matches = difflib.get_close_matches(term, list(candidates.keys()), n=1, cutoff=0.70)
+                if matches:
+                    display_term = " ".join(words[i:i + n])
+                    return display_term, candidates[matches[0]]
+        return None
 
     def exists(self, slug: str) -> bool:
         return self.get(slug) is not None

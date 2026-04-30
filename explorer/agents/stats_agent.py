@@ -25,8 +25,9 @@ class StatsAgent(BaseExplorerAgent):
             query_project_stats,
             query_top_committers,
             query_commit_activity,
+            query_contributor_profile,
         )
-        return [query_project_stats, query_top_committers, query_commit_activity]
+        return [query_project_stats, query_top_committers, query_commit_activity, query_contributor_profile]
 
     def handle(self, query: str, project_slug: str | None = None, **kwargs) -> str:
         slug = project_slug or self._infer_project_slug(query)
