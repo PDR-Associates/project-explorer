@@ -105,17 +105,21 @@ intent_patterns:
       - 'working (code )?(example|demo|sample)'
       - 'example (of how to|showing how to|that demonstrates|for using|for calling)'
       - '(create|build|write).{0,30}python.{0,30}(script|program|example|sample)'
+      - '(show|give) (me )?(an? )?(example|sample|demo) (of|for) \w'
+      - '(example|sample|demo) (of|for) \w'
+      - 'how (do i|to|can i).{0,50}(use|call|invoke|work with)\b'
+      - '\w.{3,60} (example|usage example|demo)(\?)?$'
 
   code_search:
     priority: NORMAL
     description: Questions about code, methods, functions, APIs
     patterns:
-      - "how (do I|to|can I) (use|call|implement|create|build)"
-      - "show (me )?(an? )?(example|sample|code)"
-      - "what does (method|function|class|module) .+ do"
-      - "how is .+ implemented"
-      - "source code for"
-      - "api (for|to)"
+      - 'how (do I|to|can I) (implement|build) \w'
+      - 'show (me )?(the )?(source |implementation |code (for|of))'
+      - 'what does (method|function|class|module) .+ do'
+      - 'how is .+ implemented'
+      - 'source code for'
+      - 'api (for|to)'
 
   conceptual:
     priority: NORMAL
