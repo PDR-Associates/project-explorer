@@ -79,6 +79,19 @@ class MetricsCollector:
                  latency_ms, int(cache_hit), len(response),
                  json.dumps(chunk_refs or [])),
             )
+        # Non-blocking MLflow logging (already called from a daemon thread)
+        try:
+            from explorer.observability.mlflow_tracking import log_query
+            log_query(
+                query=query,
+                intent=intent,
+                project_slug=project_slug,
+                response=response,
+                latency_ms=latency_ms,
+                collections_used=chunk_refs or [],
+            )
+        except Exception:
+            pass
 
     def record_feedback(self, query_hash: str, feedback: int) -> None:
         """Record thumbs-up (+1) or thumbs-down (-1) for a query and update per-chunk scores."""

@@ -40,9 +40,7 @@ class CodeParser:
         ext = PurePath(file_path).suffix.lower()
         language = self.LANGUAGE_MAP.get(ext, "text")
 
-        # TODO: language-specific AST splitting (tree-sitter or similar)
-        # For now: fixed-size token window
-        chunks = self._fixed_window(content)
+        chunk_texts = self._split(content, language)
         return [
             CodeChunk(
                 text=chunk,
@@ -53,8 +51,20 @@ class CodeParser:
                     "chunk_index": i,
                 },
             )
-            for i, chunk in enumerate(chunks)
+            for i, chunk in enumerate(chunk_texts)
         ]
+
+    def _split(self, content: str, language: str) -> list[str]:
+        """Attempt AST-aware splitting; fall back to fixed-window if unavailable."""
+        try:
+            from explorer.ingestion.ast_chunker import ASTChunker
+            if ASTChunker.is_available() and language in ("python", "javascript", "typescript", "go", "java"):
+                chunks = ASTChunker().chunk(content, language, self.chunk_size, self.chunk_overlap)
+                if chunks:
+                    return chunks
+        except Exception:
+            pass
+        return self._fixed_window(content)
 
     def _fixed_window(self, text: str) -> list[str]:
         words = text.split()

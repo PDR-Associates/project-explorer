@@ -54,6 +54,9 @@ async def get_stats(slug: str) -> dict:
             "latest_release_at": row.get("latest_release_at"),
             "primary_language": row.get("primary_language"),
             "language_breakdown": lang,
+            "file_count": row.get("ingestion_file_count") or row.get("file_count"),
+            "lines_of_code": row.get("ingestion_lines_of_code") or row.get("lines_of_code"),
+            "file_count_exact": row.get("ingestion_file_count") is not None,
         },
     }
 

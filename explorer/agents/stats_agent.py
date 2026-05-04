@@ -88,15 +88,16 @@ class StatsAgent(BaseExplorerAgent):
             v = d.get(key)
             return "N/A" if v is None or v == "" else f"{v}{suffix}"
 
-        def _loc_fmt(n):
+        def _loc_fmt(n, exact: bool = False):
             if n is None:
                 return "N/A"
             n = int(n)
+            label = "" if exact else " (estimated)"
             if n >= 1_000_000:
-                return f"{n / 1_000_000:.1f}M (estimated)"
+                return f"{n / 1_000_000:.1f}M{label}"
             if n >= 1_000:
-                return f"{n / 1_000:.1f}K (estimated)"
-            return f"{n} (estimated)"
+                return f"{n / 1_000:.1f}K{label}"
+            return f"{n}{label}"
 
         def _size_fmt(kb):
             if kb is None:
@@ -136,8 +137,8 @@ class StatsAgent(BaseExplorerAgent):
             f"  Primary language:   {_val('primary_language')}",
             "",
             "── Code ────────────────────────────────",
-            f"  Files:              {_val('file_count')}",
-            f"  Lines of code:      {_loc_fmt(d.get('lines_of_code'))}",
+            f"  Files:              {_val('ingestion_file_count') if d.get('ingestion_file_count') is not None else _val('file_count')}",
+            f"  Lines of code:      {_loc_fmt(d.get('ingestion_lines_of_code'), exact=True) if d.get('ingestion_lines_of_code') is not None else _loc_fmt(d.get('lines_of_code'))}",
             f"  Language breakdown: {_val('language_breakdown')}",
             "",
             "── Community ───────────────────────────",

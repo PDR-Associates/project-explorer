@@ -25,7 +25,7 @@
     .prose table { border-collapse: collapse; width: 100%; margin-bottom: .5rem; }
     .prose th, .prose td { border: 1px solid #334155; padding: .3rem .6rem; text-align: left; }
     .prose th { background: #1e293b; }
-    .chart-box { height: 220px; margin-bottom: .5rem; }
+    .chart-box { height: 300px; margin-bottom: .5rem; }
     .project-btn.selected { background: #0e7490 !important; }
     .project-btn.compare-selected { background: #92400e !important; outline: 1px solid #f59e0b; }
     ::-webkit-scrollbar { width: 6px; }
@@ -49,7 +49,7 @@
 <div class="flex flex-1 overflow-hidden">
 
   <!-- Sidebar -->
-  <aside class="w-64 shrink-0 flex flex-col bg-slate-800 border-r border-slate-700 overflow-y-auto">
+  <aside class="w-96 shrink-0 flex flex-col bg-slate-800 border-r border-slate-700 overflow-y-auto">
     <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">Projects</div>
 
     <div class="px-2 pb-1">
@@ -235,7 +235,7 @@ async function showChart(type) {
       paper_bgcolor: '#0f172a', plot_bgcolor: '#0f172a',
       font: { color: '#94a3b8', size: 10 },
       margin: { l: 40, r: 10, t: 30, b: 30 },
-      height: 200,
+      height: 280,
     });
     if (fig.layout.xaxis) fig.layout.xaxis.gridcolor = '#1e293b';
     if (fig.layout.yaxis) fig.layout.yaxis.gridcolor = '#1e293b';

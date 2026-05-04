@@ -12,8 +12,10 @@ class QueryIntent(str, Enum):
     STATISTICAL = "statistical"
     COMPARISON = "comparison"
     INTEGRATION = "integration"
+    DEPENDENCY = "dependency"
     HEALTH = "health"
     CODE_INVENTORY = "code_inventory"
+    EXAMPLES = "examples"
     CODE_SEARCH = "code_search"
     CONCEPTUAL = "conceptual"
     GENERAL = "general"
@@ -36,7 +38,7 @@ class QueryProcessor:
 
     def classify(self, query: str) -> QueryIntent:
         q = query.lower()
-        priority_order = ["integration", "comparison", "statistical", "code_inventory", "health", "code_search", "conceptual"]
+        priority_order = ["dependency", "integration", "comparison", "statistical", "code_inventory", "health", "examples", "code_search", "conceptual"]
         for intent_name in priority_order:
             rule = self._rules.get(intent_name, {})
             for pattern in rule.get("patterns", []):

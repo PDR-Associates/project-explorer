@@ -68,6 +68,13 @@ phoenix = [
 redis = [
     "redis>=5.0.0",
 ]
+ast = [
+    "tree-sitter>=0.21",
+    "tree-sitter-python>=0.21",
+    "tree-sitter-javascript>=0.21",
+    "tree-sitter-go>=0.21",
+    "tree-sitter-java>=0.21",
+]
 
 [project.scripts]
 project-explorer = "explorer.cli.main:app"

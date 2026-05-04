@@ -583,6 +583,36 @@ The chart appears inline in the chat response — not just in the sidebar — so
 
 All bar and line charts now include `yaxis_rangemode="tozero"` in their Plotly layout. Without this, Plotly auto-scales the y-axis to the data range — a chart showing 5000 stars might span 4999–5001, making the line appear flat against the bottom of the frame. Pinning the range to zero makes magnitude visible at a glance.
 
+### Rate-Limit-Aware Commit History
+
+`_fetch_commits` makes one extra REST call per commit to retrieve per-commit `additions` and `deletions`. For active repos with hundreds of commits over a 90-day window, this can deplete GitHub's rate limit (5,000 calls/hour for authenticated users) faster than expected — especially when combined with the other API calls in `StatsFetcher.fetch()`. Extending the window to 365 days multiplies the exposure.
+
+The original code detected rate limit errors per call and stopped gracefully, but it never looked ahead — it entered the loop and blasted the API until it hit the wall. The fix has two layers:
+
+**Pre-check before the loop.** Before iterating over commits, check the remaining quota. If fewer than 100 calls remain, skip diff stats for this run entirely:
+
+```python
+fetch_diff_stats = True
+try:
+    rl = self.client.check_rate_limit()
+    if rl["remaining"] < 100:
+        fetch_diff_stats = False
+except Exception:
+    pass  # optimistic if the check itself fails
+```
+
+**Periodic re-check inside the loop.** Even with a healthy quota at the start, a long history can exhaust it mid-loop. Re-checking every 50 diff-stat calls catches this before hitting the wall:
+
+```python
+diff_calls += 1
+if diff_calls % 50 == 0:
+    rl = self.client.check_rate_limit()
+    if rl["remaining"] < 100:
+        fetch_diff_stats = False
+```
+
+When diff stats are skipped, commits are stored without `additions`/`deletions`. The next `refresh` picks up where this left off — the existing `existing_with_stats` set skips commits already stored with non-null stats, so partial fetches accumulate correctly across runs. Running `project-explorer refresh <slug>` when the rate limit has reset fills in the missing diff stats without re-fetching commit metadata.
+
 ---
 
 ## Phase 7: Observability
@@ -802,6 +832,659 @@ We defaulted to port 8100 rather than 8080 because 8080 is a common default for 
 
 ---
 
+## Phase 10: Accurate Ingestion Metrics and Sub-Project Indexing
+
+### The Problem With Estimated Statistics
+
+After Phase 6, `project_stats` held file counts and lines-of-code estimates computed from GitHub API data — specifically, a bytes-per-line lookup table that applied different multipliers per file extension. The estimates were consistently wrong for repos with mixed content: a Python project with large test fixtures might show 15 000 lines when it had 3 000, or vice versa for repos with long auto-generated files.
+
+The fix is simple: count the actual files and actual newlines during ingestion, when we already have every file on disk.
+
+### Counting During Ingestion
+
+`IngestionPipeline.run()` now calls `_count_repo_stats()` after processing all collections:
+
+```python
+def _count_repo_stats(local_root: Path) -> tuple[int, int]:
+    """Walk repo and return (file_count, lines_of_code)."""
+    file_count = 0
+    loc = 0
+    for path in local_root.rglob("*"):
+        if path.is_file() and path.suffix in _TEXT_SUFFIXES:
+            file_count += 1
+            try:
+                loc += path.read_bytes().count(b"\n")
+            except OSError:
+                pass
+    return file_count, loc
+```
+
+The result is stored in two new columns — `ingestion_file_count` and `ingestion_lines_of_code` — alongside the old GitHub-estimated columns. Agents and the web UI prefer the ingestion-measured values when available, falling back to estimates for projects that have been added but not yet refreshed.
+
+```bash
+# Trigger a re-index to populate real counts
+project-explorer refresh <slug>
+
+# Confirm accurate numbers appear
+project-explorer list --details
+```
+
+The web stats endpoint (`/api/stats/{slug}`) now returns a `file_count_exact` boolean, so the UI can display "(estimated)" when showing pre-ingestion data.
+
+### GitHub Tree Truncation and the GitHub-Estimated File Count
+
+Before Phase 10, `file_count` in `project_stats` came from `get_git_tree(recursive=True)` — a single GitHub API call that returns every file path in the repo. This appears to work but silently fails for large repos: GitHub truncates the response when the total number of tree nodes (files *plus* directory objects) exceeds roughly 100,000, and sets `tree.truncated = True` in the response. A large Java monorepo like Egeria, with 28,000+ source files and thousands of nested `com/example/deep/package/` directory entries, easily exceeds this limit. Without checking `tree.truncated`, the count stops wherever the truncated response ended — typically 4–6× below the actual file count.
+
+The fix is to detect the truncated flag and, when set, fetch the root **non-recursively** before walking:
+
+```python
+tree = repo.get_git_tree(repo.default_branch, recursive=True)
+if not tree.truncated:
+    return sum(1 for e in tree.tree if e.type == "blob")
+# Truncated response is cut off mid-traversal — its entry list is incomplete.
+# Fetch root non-recursively to get ALL top-level entries, then walk each subtree.
+root = repo.get_git_tree(repo.default_branch, recursive=False)
+return _count_files_walk(repo, root)
+```
+
+The critical detail is that the truncated recursive tree **cannot be used as the starting point** for the walk. GitHub fills the response in traversal order and stops at the size limit — directories appearing later in the listing are silently absent from `tree.tree`. Passing that partial list to `_count_files_walk` would miss everything after the cutoff. Fetching the root non-recursively always returns a complete list of direct children (the root directory has far fewer than 100k direct entries), giving a reliable starting set. `_count_files_walk` then fetches each top-level directory with `recursive=True`, and those per-directory responses are almost never truncated. For Egeria this means roughly 30 API calls instead of one, yielding an accurate count.
+
+The same fix was applied to `GitHubClient.list_files()`, which `RepoAnalyzer` uses during onboarding to decide which collection types to create.
+
+Note that `ingestion_file_count` (counted directly from the locally-extracted zipball) remains the preferred value for display and is always accurate. The GitHub-estimated `file_count` in `project_stats` serves as the pre-ingestion baseline, and its accuracy for large repos is now greatly improved.
+
+### Sub-Project Indexing for Monorepos
+
+Some repositories contain multiple independent sub-projects in separate subdirectories. Egeria, for example, contains `pyegeria` (the core library), `commands/` (the `hey_egeria` CLI), and `md_processing/` (the `dr_egeria` document tool). A single index of the full repo mixes all three vocabularies, degrading retrieval quality for targeted questions.
+
+The `--subpath` and `--name` flags let you register each sub-project separately:
+
+```bash
+# Register the full repo first (optional but provides a parent reference)
+project-explorer add https://github.com/odpi/pyegeria
+
+# Register each sub-project as a distinct, independently searchable project
+project-explorer add https://github.com/odpi/pyegeria \
+    --subpath commands \
+    --name hey_egeria
+
+project-explorer add https://github.com/odpi/pyegeria \
+    --subpath md_processing \
+    --name dr_egeria
+
+# Each sub-project appears independently in the list
+project-explorer list --details
+
+# Query each sub-project in isolation
+project-explorer ask --project hey_egeria "What CLI commands are available?"
+project-explorer ask --project dr_egeria "How does document processing work?"
+```
+
+`--name` is required when `--subpath` is given — without it there is no way to derive an unambiguous slug when multiple sub-projects share the same parent URL.
+
+Internally, when only `--subpath` is given (no `--extra-docs-path`), `GitHubClient.download_zipball()` downloads the full repo zipball and returns `repo_root / subproject_path` directly. All downstream ingestion code walks whatever root path it receives, so code collections see only the subproject files.
+
+The `Project` dataclass stores `subproject_path`, `parent_slug`, and `extra_docs_paths` for use by ingestion and refresh.
+
+### Docs and Examples Outside the Code Subpath
+
+Some repositories keep documentation and examples at the repo root, shared across multiple sub-projects. For example, `egeria-python` stores its API guide at `docs/user_programming.md` and its Jupyter notebooks in `examples/`, both outside the `pyegeria/` subdir. Without extra coverage, those files are invisible to the `pyegeria` project index — `--subpath` scopes the download to just that subdirectory.
+
+`--extra-docs-path` specifies additional repo-relative paths to ingest into doc/example collections alongside the code from `--subpath`. Each path can be a file or a directory; repeat the flag for multiple paths:
+
+```bash
+project-explorer add https://github.com/odpi/egeria-python \
+  --subpath pyegeria \
+  --name pyegeria \
+  --extra-docs-path docs/user_programming.md \
+  --extra-docs-path examples/
+```
+
+Internally, when `--extra-docs-path` is set the pipeline downloads the **full** repo (not the subpath-filtered zipball). It then sets `code_root = repo_root / subpath` for code collections (`python_code`, `go_code`, etc.), and additionally walks the extra paths when ingesting doc/example collections (`markdown_docs`, `examples`, `api_reference`, `pdfs`). The paths are stored in the `Project` registry entry and re-applied automatically on every `refresh`.
+
+The flag is silently ignored without `--subpath` — when the full repo is already the code root, every path within it is already covered.
+
+The ingestion pipeline was refactored to support this cleanly. Two helpers were extracted from `run()`:
+
+- `_setup_roots(full_root, subproject_path, extra_docs_paths)` — derives `code_root` and `resolved_extra` (list of `(display_prefix, abs_path)` tuples) from a repo root, whether that root came from a local clone or a download
+- `_ingest_from_root(project_slug, repo, collection_types, code_root, resolved_extra, active_collections)` — runs the ingestion loop and returns `(file_count, loc)`
+
+Extracting these helpers also enables the next feature.
+
+### Avoiding Repeated Downloads with --from-local
+
+Each `project-explorer add` call downloads the repo from GitHub — a full-repo zipball when `--extra-docs-path` is set, or a subpath-filtered zipball otherwise. Registering four sub-projects from a large monorepo triggers four separate downloads, which is slow and burns GitHub API bandwidth.
+
+`--from-local` points to an existing local clone and skips the download entirely:
+
+```bash
+# Clone once
+git clone https://github.com/odpi/egeria-python /tmp/egeria-python
+
+# Register all four sub-projects using the same local clone
+project-explorer add https://github.com/odpi/egeria-python \
+  --subpath pyegeria --name pyegeria \
+  --extra-docs-path docs/user_programming.md \
+  --from-local /tmp/egeria-python
+
+project-explorer add https://github.com/odpi/egeria-python \
+  --subpath md_processing --name dr_egeria \
+  --extra-docs-path docs/dr_egeria_manual.md \
+  --from-local /tmp/egeria-python
+
+project-explorer add https://github.com/odpi/egeria-python \
+  --subpath commands --name hey_egeria \
+  --from-local /tmp/egeria-python
+
+project-explorer add https://github.com/odpi/egeria-python \
+  --subpath pyegeria/view --name egeria_views \
+  --extra-docs-path docs/output-formats-and-report-specs.md \
+  --from-local /tmp/egeria-python
+```
+
+The GitHub URL is still stored in the registry for stats fetching, incremental refresh, and webhook events. `--from-local` is purely a download shortcut for the initial `add` — it has no effect on `refresh`, which always re-downloads from GitHub to pick up new commits.
+
+`--from-local` is also useful outside the monorepo context: you can index a work-in-progress branch before pushing it, or index a repo you have locally for offline use.
+
+---
+
+## Phase 11: Event-Driven Refresh via GitHub Webhook
+
+### The Problem With Manual Refresh
+
+After Phase 8, keeping a project index current required running `project-explorer refresh <slug>` by hand. For active repos with dozens of commits per day, this means stale data unless the user remembers to refresh.
+
+The fix is a GitHub Push webhook: GitHub posts a notification to your server every time someone pushes to the repo. The server re-indexes automatically.
+
+### The Webhook Endpoint
+
+`explorer/web/routes/webhook.py` exposes `POST /api/webhook/github`. The implementation has two concerns: security (verify the request actually came from GitHub) and idempotency (trigger refresh exactly once per push, even if GitHub retries).
+
+```python
+@router.post("/webhook/github")
+async def github_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_github_event: str = Header(default=""),
+    x_hub_signature_256: str = Header(default=""),
+) -> dict:
+    body = await request.body()
+    secret = get_config().github.webhook_secret
+    if secret:
+        if not _verify_signature(body, x_hub_signature_256, secret):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    if x_github_event != "push":
+        return {"status": "ignored", "event": x_github_event}
+    data = json.loads(body)
+    repo_url = data.get("repository", {}).get("html_url", "")
+    project = ProjectRegistry().get_by_github_url(repo_url)
+    if not project:
+        return {"status": "unregistered", "url": repo_url}
+    background_tasks.add_task(_do_refresh, project.slug)
+    return {"status": "refresh_scheduled", "slug": project.slug}
+```
+
+Signature verification uses HMAC-SHA256:
+
+```python
+def _verify_signature(body: bytes, header: str, secret: str) -> bool:
+    expected = "sha256=" + hmac.new(
+        secret.encode(), body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, header)
+```
+
+When no secret is configured, verification is skipped — this allows unauthenticated testing in development. In production, always set the secret.
+
+For unknown repos, the endpoint returns `{"status": "unregistered"}` with HTTP 200. GitHub retries on non-2xx responses, so returning 404 for an unregistered repo would cause unnecessary retries.
+
+The refresh runs as a FastAPI `BackgroundTask`, which completes after the HTTP response is sent. GitHub does not wait for the re-index to complete before considering the webhook delivered.
+
+### Configuration
+
+Add the webhook secret to your `.env`:
+
+```bash
+GITHUB_WEBHOOK_SECRET=your_secret_here
+```
+
+In the target repo's GitHub settings (Settings → Webhooks → Add webhook):
+- **Payload URL:** `https://your-host/api/webhook/github`
+- **Content type:** `application/json`
+- **Secret:** same value as `GITHUB_WEBHOOK_SECRET`
+- **Which events:** Push events only
+
+**Testing locally:**
+
+```bash
+# Start the web server
+project-explorer web
+
+# Simulate a push event (replace the HMAC with a real computed value or omit if no secret is set)
+curl -X POST http://localhost:8000/api/webhook/github \
+  -H "Content-Type: application/json" \
+  -H "X-GitHub-Event: push" \
+  -d '{"repository":{"html_url":"https://github.com/owner/repo"}}'
+```
+
+---
+
+## Phase 12: Persistent Conversation History
+
+### The Problem With In-Process Session State
+
+Phase 8 stored web UI sessions in a server-side dict. When the FastAPI server restarted, all conversation history was lost — users had to repeat context they had already provided. The CLI `chat` command had no persistence at all: quitting and restarting produced a fresh session with no memory of prior turns.
+
+The fix is to persist each turn to SQLite as it happens, and reload the history when a session is reconnected.
+
+### The SQLite Schema
+
+`conversation_history` stores each turn with a session ID and turn index:
+
+```sql
+CREATE TABLE conversation_history (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    turn_idx   INTEGER NOT NULL,
+    role       TEXT NOT NULL,       -- 'user' | 'assistant'
+    content    TEXT NOT NULL,
+    project_slug TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_conv_session ON conversation_history(session_id, turn_idx);
+```
+
+`Registry.append_turn()` writes each turn after it completes. `Registry.load_turns()` retrieves the last N turns for a session, ordered by `turn_idx`. Both are called by every code path that creates or continues a conversation.
+
+### Rehydrating BeeAI Memory
+
+`ConversationAgent.load_history()` takes the list of saved turns and injects them into BeeAI's `TokenMemory`:
+
+```python
+async def _load_async(self, turns: list[dict]) -> None:
+    agent = await self._ensure_agent()
+    for turn in turns:
+        if turn["role"] == "user":
+            await agent.memory.add(UserMessage(content=turn["content"]))
+        else:
+            await agent.memory.add(AssistantMessage(content=turn["content"]))
+```
+
+This is called once when a session is first created on the server side. Subsequent turns in the session flow normally through BeeAI's `TokenMemory` accumulation — only the reconnect case requires explicit injection.
+
+### CLI Usage
+
+The `chat` command accepts an optional `--session-id` flag:
+
+```bash
+# Start a new session (prints the generated session ID at startup)
+project-explorer chat
+# Session: 7f3a91b2-...
+
+# Ctrl-C to quit, then resume later with the same session ID
+project-explorer chat --session-id 7f3a91b2-...
+# Resumed session 7f3a91b2-... (12 turns)
+```
+
+The session ID is a UUID that acts as the only credential for the session — keep it if you want to resume, discard it to start fresh.
+
+### Web UI
+
+The web UI already generates a session UUID via `crypto.randomUUID()` and stores it in `localStorage`. After this change, the server loads prior turns from SQLite when a new `ConversationAgent` is created for that UUID. A user can clear browser storage to start a fresh session, or return after restarting the server and find their conversation intact.
+
+---
+
+## Phase 13: AST-Based Code Chunking
+
+### The Problem With Fixed-Window Chunking
+
+Phase 2's `_fixed_window()` splits source code into overlapping windows of N tokens. It has no awareness of function or class boundaries — a 512-token window might start in the middle of a method signature and end halfway through the method body. Retrieval then returns partial function definitions that are hard to interpret and embed poorly.
+
+The consequence shows up in code-specific queries: "how is the X method implemented?" returns chunks that contain only part of the method, and the answer is incomplete or contradictory.
+
+### tree-sitter for Boundary-Aware Chunking
+
+[tree-sitter](https://tree-sitter.github.io/tree-sitter/) is a parser generator that produces concrete syntax trees for dozens of programming languages. We use it to split code at natural boundaries — function definitions, class definitions, method bodies — instead of at arbitrary token counts.
+
+The optional `ast` extra installs tree-sitter with grammars for Python, JavaScript, Go, and Java:
+
+```bash
+uv sync --extra ast
+```
+
+`ASTChunker.chunk()` parses the source file, walks the top-level AST nodes, and produces boundary-aligned chunks:
+
+1. Collect top-level nodes (function/class definitions for the language)
+2. If a node fits within `max_tokens`, emit it as a chunk
+3. If a node is too large, split it at inner boundaries (methods within a class)
+4. If a segment is too small, merge it with the next one using overlap prefix
+
+Each chunk gets a header comment with the filename and start line:
+
+```python
+# explorer/agents/tools.py:42
+def vector_search(query: str, collection_names: str) -> str:
+    ...
+```
+
+This header is embedded with the chunk and appears in retrieval results, letting the model cite the exact location of the code it is referencing.
+
+`CodeParser._split()` tries the AST chunker first and falls back to `_fixed_window()` if tree-sitter is not installed or the language is unsupported:
+
+```python
+def _split(self, content: str, language: str, chunk_size: int, overlap: int) -> list[str]:
+    try:
+        from explorer.ingestion.ast_chunker import ASTChunker
+        if ASTChunker.is_available() and language in ASTChunker.SUPPORTED_LANGUAGES:
+            return ASTChunker().chunk(content, language, chunk_size, overlap)
+    except Exception:
+        pass
+    return self._fixed_window(content, chunk_size, overlap)
+```
+
+This means users without tree-sitter see no change in behavior. Users with it get better chunking transparently after the next `refresh`.
+
+**Verification:**
+
+```bash
+# Install AST extras
+uv sync --extra ast
+
+# Re-index to apply the new chunker
+project-explorer refresh <slug>
+
+# Submit a targeted code question and inspect the chunks in Phoenix traces
+# Phoenix: http://localhost:6006 → Traces → expand the vector_search tool call
+project-explorer ask --project <slug> "How is the authentication middleware implemented?"
+```
+
+---
+
+## Phase 14: Dependency Graph Agent
+
+### Why a Dedicated Dependency Agent
+
+Code, documentation, and statistics each have specialized agents tuned for their data source. Dependency information — which packages a project requires, which version, which type (runtime vs. dev) — falls into none of those categories. Sending "what does pyegeria depend on?" through general RAG would return README snippets mentioning package names, not a structured list of actual declared dependencies.
+
+The dependency agent follows the same pattern as the stats agent: parse structured data during ingestion, store it in SQLite, answer queries directly without touching Milvus.
+
+### Dependency Parsing During Ingestion
+
+`DependencyParser.parse(local_root, project_slug)` scans the repository root for manifest files and returns a list of dependency records:
+
+| File | Ecosystem | Parser |
+|---|---|---|
+| `pyproject.toml` | Python | `tomllib` (3.11+) or `tomli`; handles PEP 517, Poetry |
+| `requirements*.txt` | Python | Line-by-line; infers dev from filename |
+| `setup.py` | Python | Regex on `install_requires=[...]` |
+| `package.json` | JavaScript | JSON parse; `dependencies`, `devDependencies`, `peerDependencies` |
+| `go.mod` | Go | Line-by-line `require` block; marks indirect |
+| `pom.xml` | Java | `xml.etree.ElementTree`; `<dependency>` elements |
+
+Each record has: `dep_name`, `dep_version`, `dep_type` (runtime/dev/optional/build), `ecosystem`, and `source_file`. Records are deduplicated by `(dep_name, ecosystem, source_file)` before being stored.
+
+The pipeline calls `DependencyParser` at the end of ingestion, so dependencies are always current after a `refresh`.
+
+### The Dependency Agent
+
+`DependencyAgent` handles the `DEPENDENCY` intent. It queries `project_dependencies` directly via `Registry.query_dependencies()`:
+
+```bash
+# After refresh, ask dependency questions
+project-explorer ask --project pyegeria "What Python packages does this project require?"
+project-explorer ask "What are the runtime dependencies of hey_egeria?"
+
+# Cross-project shared dependency query
+project-explorer ask "Which projects use pandas?"
+project-explorer ask "What packages do pyegeria and unitycatalog share?"
+```
+
+`query_dependencies` is a BeeAI `@tool` that returns results as a markdown table:
+
+```
+| Package    | Version  | Type    | Ecosystem |
+|------------|----------|---------|-----------|
+| requests   | >=2.28   | runtime | python    |
+| pytest     | >=7.0    | dev     | python    |
+| pandas     | >=2.0    | runtime | python    |
+```
+
+For cross-project queries, `Registry.query_shared_dependencies()` does a self-join on `project_dependencies` and returns packages that appear in multiple project indexes.
+
+### Routing
+
+`QueryIntent.DEPENDENCY` was added to the intent enum and placed first in the priority order (above `INTEGRATION`) so that "what packages does X require?" does not fall through to the integration agent. Patterns in `config/routing.yaml` match a wide range of phrasings:
+
+```yaml
+dependency:
+  priority: HIGH
+  patterns:
+    - 'go\.mod|pyproject\.toml|package\.json|requirements\.txt'
+    - '(list|show|what are).{0,30}(dep|package|librar|requirement)'
+    - 'what.{0,40}(use|require|depend on|import).{0,20}(package|librar|dep|module)'
+    - '(runtime|dev|optional|indirect)\s+dep'
+    - 'which projects?.{0,20}(use|depend on|require|import)'
+```
+
+**Verification:**
+
+```bash
+# Re-index to parse dependency manifests
+project-explorer refresh <slug>
+
+# Confirm dependencies were stored
+uv run python -c "
+from explorer.registry import ProjectRegistry
+deps = ProjectRegistry().query_dependencies('<slug>')
+print(f'{len(deps)} deps indexed')
+print(deps[:3])
+"
+
+# Ask natural-language questions
+project-explorer ask --project <slug> "What are the runtime dependencies?"
+```
+
+---
+
+## Phase 15: Retrieval Evaluation Harness
+
+### Why a Formal Eval Harness
+
+After every code change, there is a risk of retrieval regressions: a routing pattern that was too broad, a chunker change that degraded semantic similarity, or a prompt change that stopped including relevant context. Without a repeatable quality metric, regressions are invisible until a user notices.
+
+The eval harness provides a `--min-recall` gate: if mean keyword recall drops below threshold, the eval script exits non-zero and the problem is visible immediately.
+
+### The Golden Dataset
+
+`tests/fixtures/golden_qa.json` contains 25 query/answer pairs covering all intent types:
+
+```json
+[
+  {
+    "query": "Who are the top contributors?",
+    "intent": "statistical",
+    "expected_keywords": ["contributor", "commit"],
+    "notes": "Requires project_commits data"
+  },
+  {
+    "query": "What are the runtime dependencies?",
+    "intent": "dependency",
+    "expected_keywords": ["runtime", "depend", "package"],
+    "notes": "Requires dependency data indexed"
+  }
+]
+```
+
+Each entry defines:
+- `query` — the natural-language question to ask
+- `intent` — the expected classified intent (used to measure `intent_accuracy`)
+- `expected_keywords` — words that must appear in the response for it to be considered a hit
+- `notes` — which data must be indexed for the query to be answerable
+
+`keyword_recall` is the fraction of expected keywords found in the response (case-insensitive). This is a weak but fast signal: if the right keywords are present, the system at least retrieved something relevant. Strong recall but wrong answer is a synthesis failure, not a retrieval failure — useful to distinguish.
+
+### Running the Eval
+
+```bash
+# Run against a specific indexed project
+uv run python scripts/eval_retrieval.py --project <slug>
+
+# Tighten the threshold for critical paths
+uv run python scripts/eval_retrieval.py --project <slug> --min-recall 0.80
+
+# Skip MLflow logging (useful in CI without an MLflow server)
+uv run python scripts/eval_retrieval.py --project <slug> --no-mlflow
+
+# Use a custom dataset
+uv run python scripts/eval_retrieval.py --project <slug> --golden path/to/my_qa.json
+```
+
+Output:
+
+```
+Running 25 eval queries scoped to 'pyegeria'...
+
+   1. [✓] Who are the top contributors?            recall=100%  312ms  intent=statistical
+   2. [✓] Show me the commit activity over the ...  recall=100%  287ms  intent=statistical
+   3. [✗] How many forks does this project have?   recall= 67%  298ms  intent=statistical
+   ...
+
+======================================================================
+  Queries:          25
+  Mean recall:      82.3%  (threshold: 70.0%)
+  Intent accuracy:  96.0%
+  Mean latency:     341ms
+======================================================================
+
+PASS
+```
+
+### MLflow Integration
+
+`MetricsCollector.record_query()` now calls `mlflow_tracking.log_query()` at the end of every query (in the existing daemon thread, so latency is unaffected). The eval script logs a dedicated run to the `project-explorer-eval` MLflow experiment:
+
+```bash
+# Start MLflow server (required for logging)
+mlflow server --port 5025
+
+# Run eval with logging enabled (default)
+uv run python scripts/eval_retrieval.py --project <slug>
+
+# Open the MLflow UI and inspect the eval run
+open http://localhost:5025
+```
+
+Each eval run records `mean_keyword_recall`, `mean_latency_ms`, and `intent_accuracy` as summary metrics, plus per-query `keyword_recall` and `latency_ms` as step metrics. Comparing runs before and after a routing change makes regressions immediately visible in the MLflow comparison view.
+
+---
+
+## Phase 16: Python Examples Agent
+
+### Why Example Generation Is a Different Problem Than Code Search
+
+The `CodeAgent` (Phase 4) finds existing code in indexed collections — it retrieves and surfaces what is already there. Example generation is the inverse: it produces new, complete, runnable code that does not exist in the index, using retrieved content as grounding. Routing example requests through `CodeAgent` produces partial matches — snippets of real code that aren't complete programs — or through general RAG, which produces prose descriptions of how to write code rather than the code itself.
+
+The distinction matters because:
+- An LLM that retrieves a half-implementation of a method will complete the rest by hallucinating plausible but wrong arguments and return types.
+- A correctly-scoped system prompt that says "only use methods you found in context" and "never invent an API" changes the failure mode from silent hallucination to explicit uncertainty.
+- Example generation needs *breadth* of context (API docs, existing samples, import patterns, README usage) across multiple collections simultaneously, whereas code search needs *depth* in the most relevant single chunk.
+
+### The `build_example_context` Tool
+
+All existing agents call `vector_search(query, collection_names)` with explicit collection names. `ExamplesAgent` needs context from four different collection types simultaneously, and requiring the LLM to issue four separate `vector_search` calls wastes iterations and risks missing collections it doesn't think to try.
+
+`build_example_context(project_slug, topic)` encapsulates this breadth search:
+
+```python
+@tool(description="Gather context for generating a Python code example...")
+def build_example_context(project_slug: str, topic: str) -> str:
+    collection_types = ["examples", "python_code", "api_reference", "markdown_docs"]
+    candidate_collections = [f"{slug}_{ctype}" for ctype in collection_types]
+    existing = [c for c in candidate_collections if client.has_collection(c)]
+
+    searches = [
+        (topic, existing),
+        (f"import install setup {slug}", existing),
+        ("usage example how to", [c for c in existing if "examples" in c or "markdown" in c]),
+    ]
+    # Deduplicate by text, threshold at score >= 0.3
+    ...
+```
+
+Three targeted queries cover: the specific topic, setup/install patterns (so the example starts with correct imports), and narrative usage examples from README-style docs. Results are deduplicated and returned as a single formatted block.
+
+The tool uses `client.has_collection(c)` to silently skip collections that haven't been indexed for this project — not every project has an `examples` collection, and missing ones should not cause errors.
+
+### The System Prompt Approach
+
+The key to reliable example generation is a system prompt with explicit negative constraints, not just positive instructions. The `ExamplesAgent` prompt includes:
+
+- *"Only use class names, method names, and parameters you saw in the retrieved context."*
+- *"Never invent API methods. If you cannot find the right API, say so and show the closest available alternative."*
+- *"If a detail is unclear, use a clearly labelled placeholder like `YOUR_HOST` or `YOUR_TOKEN`."*
+
+Without these constraints, the LLM completes gaps in its knowledge with plausible-but-wrong API calls, which is worse than an explicit "I'm not sure." LLMs have strong priors about how Python libraries tend to look, and those priors override retrieved evidence when the prompt doesn't explicitly forbid it.
+
+The format requirement — fenced `python` block followed by a short explanation — separates the runnable artifact from the prose, making it easy for UIs and users to copy the code without parsing it out of surrounding text.
+
+### Routing
+
+`QueryIntent.EXAMPLES` sits between `health` and `code_search` in the priority order. Placing it above `code_search` ensures that "show me how to use X in Python" routes to `ExamplesAgent` rather than `CodeAgent`. The patterns are specific enough that ambiguous queries like "show me the code for X" (without language or "example" keywords) still fall through to `code_search`:
+
+```yaml
+examples:
+  patterns:
+    - 'generate (a |an |me )?(python )?(example|sample|snippet|code|demo)'
+    - 'write (me )?(a |an )?(python )?(example|code|script|snippet|demo)'
+    - '(show me|how do i|how to).{0,40}(in python|using python|with python)'
+    - 'code (example|sample|snippet) (for|to|showing|that|using)'
+    - 'working (code )?(example|demo|sample)'
+    - 'example (of how to|showing how to|that demonstrates|for using)'
+```
+
+**Usage:**
+
+```bash
+# Generate a complete Python example
+project-explorer ask --project egeria_python "write me a python example for connecting to Egeria and listing assets"
+project-explorer ask --project hey_egeria "show me how to use the hey_egeria CLI programmatically in Python"
+
+# Works through the web UI and chat too
+project-explorer chat --project egeria_python
+# > generate a working example that authenticates and queries the glossary
+```
+
+### The Fallback Path
+
+When BeeAI fails (LLM timeout, tool error, max iterations reached), `ExamplesAgent._fallback()` bypasses the agent loop and calls the underlying retrieval logic directly, then constructs a single LLM prompt from the aggregated context.
+
+**BeeAI `FunctionTool` objects have no `.func` attribute** — you cannot call `my_tool.func(...)` to invoke the wrapped function. The correct pattern is to extract the implementation into a private `_raw` helper and have the `@tool` wrapper delegate to it:
+
+```python
+def _build_example_context_raw(project_slug: str, topic: str) -> str:
+    # ... full implementation ...
+
+@tool(description="...")
+def build_example_context(project_slug: str, topic: str) -> str:
+    return _build_example_context_raw(project_slug, topic)
+```
+
+The fallback then imports and calls `_build_example_context_raw` and `_query_code_symbols_raw` directly — plain Python, no BeeAI involved. This gives a best-effort response rather than an error, at the cost of fewer tool iterations.
+
+The pattern — try the agent, fall back to a direct retrieval+LLM call using `_raw` helpers — applies to any agent where a partial answer is more useful than an exception.
+
+### Extending to Other Languages
+
+The agent is Python-first by design. The path to supporting other languages:
+
+1. Add a `language` parameter to `ExamplesAgent.handle()` and thread it into the prompt.
+2. In `build_example_context`, extend `collection_types` to include `javascript_code`, `java_code`, etc. based on the requested language.
+3. Add language-detection patterns to `routing.yaml` (e.g., `"in javascript"`, `"using java"`).
+
+No schema changes, no new agent class — the system prompt and collection list are the only language-specific pieces.
+
+---
+
 ## Lessons Learned
 
 ### Classify Intent Before Retrieving
@@ -866,13 +1549,18 @@ Both patterns are short (5–10 lines each) but easy to get wrong. Test them ear
 | Agent framework | BeeAI Framework | RequirementAgent + @tool = iterative tool-calling with minimal boilerplate |
 | A2A protocol | AgentStack SDK | Standard inter-agent discovery and communication |
 | Document parsing | Docling | PDF, HTML, structured docs with layout analysis |
+| AST parsing | tree-sitter (optional) | Boundary-aware code chunking; graceful fallback when not installed |
+| Dependency parsing | stdlib (tomllib, json, xml, re) | Zero new deps; handles pyproject.toml, package.json, go.mod, pom.xml |
 | CLI | Typer + Rich | Type-safe commands, zero boilerplate, beautiful output |
 | TUI | Textual | Full-screen terminal UI, widget system, CSS layout |
-| Web backend | FastAPI | Async, SSE streaming, typed request/response models |
+| Web backend | FastAPI | Async, SSE streaming, typed request/response models, webhook endpoint |
 | Web frontend | Tailwind + Plotly.js + marked.js | No build step, dark theme, interactive charts, markdown rendering |
 | LLM tracing | Arize Phoenix | Per-call traces via OpenTelemetry, open source, runs locally |
-| Experiment tracking | MLflow | Query metrics, latency, feedback logging, open source |
+| Experiment tracking | MLflow | Query metrics, latency, feedback logging, eval runs; open source |
 | Caching | LRU (in-process) / Redis | LRU for single-process; Redis for multi-process deployments |
+| Conversation persistence | SQLite (conversation_history) | Zero infrastructure; survives server restarts; CLI and web UI share the same store |
+| Dependency storage | SQLite (project_dependencies) | Structured deps indexed during ingestion; fast cross-project shared-dep queries |
+| Retrieval eval | scripts/eval_retrieval.py | Keyword recall scoring against a golden Q&A dataset; exits non-zero on regression |
 
 Every component in this stack is open source. The only proprietary dependency is a GitHub token for API access — and unauthenticated access works for public repos at 60 requests/hour.
 
@@ -882,12 +1570,12 @@ Every component in this stack is open source. The only proprietary dependency is
 
 The natural next extensions, roughly in order of impact:
 
-1. **Evaluation harness** — build a test set of (query, expected intent, expected answer) triples and measure retrieval recall, answer correctness, and latency regression automatically
-2. **Feedback-driven reranking** — the `MultiCollectionStore` already records feedback scores; train a lightweight reranker on thumbs-up/down signals to boost relevant chunks
-3. **More collection types** — GitHub Issues, PR bodies, and discussion threads are high-signal content not yet indexed
-4. **Comparison and integration queries** — multi-project `CompareAgent` that diffs stats and runs `vector_search` across multiple projects simultaneously; `_infer_all_project_slugs()` to extract multiple slugs from one query. See [comparison-integration-approach.md](comparison-integration-approach.md) for the full design.
-5. **Code intelligence / symbol extraction** — AST-based extraction of classes, methods, and function signatures into a `project_code_symbols` SQLite table during ingestion; new `query_code_symbols` and `get_symbol_detail` tools; `code_inventory` intent for structural queries like "list all classes" and "show the signature of X". See [code-intelligence-approach.md](code-intelligence-approach.md).
-5. **Async ingestion** — the `add` command blocks until ingestion completes; move it to a background job with progress polling via the web API
-6. **Milvus HNSW index** — when collection sizes exceed ~100k chunks, switch from FLAT to HNSW for sub-linear search time
+1. **Feedback-driven reranking** — the `MultiCollectionStore` already records feedback scores and `chunk_feedback` tracks per-chunk positive/total vote counts; train a lightweight reranker on thumbs-up/down signals to boost relevant chunks in future queries
+2. **More collection types** — GitHub Issues, PR bodies, and discussion threads are high-signal content not yet indexed; each would follow the five-step extension process (collection type → file list → chunk config → route pattern → test)
+3. **Integration query improvement** — the `IntegrationAgent` already exists; the intent patterns can be expanded and the system prompt tuned to better handle "how do I use X alongside Y?" compound questions that require understanding both projects simultaneously
+4. **Async ingestion** — the `add` command blocks until ingestion completes; move it to a background job with progress polling via the web API, similar to how the webhook endpoint triggers a background refresh
+5. **Milvus HNSW index** — when collection sizes exceed ~100k chunks, switch from `FLAT` to `HNSW` in `_ensure_collection()` for sub-linear search time; the schema change is isolated to `multi_collection_store.py`
+6. **TUI stability** — the Textual TUI has known threading issues: `query_one()` called from worker threads, bare `except Exception` blocks that swallow errors, and asyncio/threading races in the memory update path; these need `call_from_thread()` throughout to match Textual's required threading model
+7. **Session browser** — `Registry.list_sessions()` is already implemented; a web UI panel listing prior sessions with timestamps would let users return to a previous conversation without knowing the session UUID
 
 The architecture is designed to support all of these without structural changes. New collection types follow the five-step extension process. New agents extend `BaseExplorerAgent`. New LLM backends implement the two-method `LLMBackend` protocol. New routing rules go in `routing.yaml`.

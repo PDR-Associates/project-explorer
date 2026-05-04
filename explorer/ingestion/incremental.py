@@ -82,22 +82,41 @@ class IncrementalIndexer:
             if not any(c == f"{project.slug}_{name}" for name in project_ctypes)
         ]
 
+        subproject_path = project.subproject_path or None
+        extra_docs_paths = project.extra_docs_paths or []
+
+        _doc_ctypes = frozenset({"markdown_docs", "web_docs", "api_reference", "examples", "pdfs"})
+
         with tempfile.TemporaryDirectory() as tmp:
             local_root = None
+            resolved_extra: list[tuple[str, Path]] = []
             if file_ctypes:
                 print("Downloading repository...")
-                local_root = self.client.download_zipball(repo, Path(tmp))
+                if subproject_path and extra_docs_paths:
+                    # Need full repo to access extra_docs_paths outside subproject_path
+                    full_root = self.client.download_zipball(repo, Path(tmp))
+                    local_root = full_root / subproject_path
+                    resolved_extra = [(p, full_root / p) for p in extra_docs_paths]
+                else:
+                    local_root = self.client.download_zipball(repo, Path(tmp), subproject_path)
 
             for name, ctype in project_ctypes.items():
                 collection_name = f"{project.slug}_{name}"
                 store.drop_collection(collection_name)
+                extra = resolved_extra if (name in _doc_ctypes and resolved_extra) else []
                 count = pipeline._ingest_collection(
                     repo, project.slug, collection_name, ctype,
                     local_root if name != "release_notes" else None,
+                    extra_paths=extra,
                 )
                 if count > 0:
                     surviving.append(collection_name)
                     print(f"  {collection_name}: {count} chunks")
+
+            if local_root is not None:
+                file_count, loc = pipeline._count_repo_stats(local_root)
+                self.registry.update_ingestion_stats(project.slug, file_count, loc)
+                pipeline._parse_dependencies(project.slug, local_root)
 
         self.registry.update_indexed_at(project.slug, surviving)
         self.registry.update_status(project.slug, ProjectStatus.ACTIVE)

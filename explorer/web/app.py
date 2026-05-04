@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from explorer.web.routes import aliases, projects, query, stats
+from explorer.web.routes import aliases, projects, query, stats, webhook
 
 app = FastAPI(
     title="Project Explorer",
@@ -22,6 +22,7 @@ app.include_router(query.router, prefix="/api/query", tags=["query"])
 app.include_router(projects.router, prefix="/api/projects", tags=["projects"])
 app.include_router(stats.router, prefix="/api/stats", tags=["stats"])
 app.include_router(aliases.router, prefix="/api/aliases", tags=["aliases"])
+app.include_router(webhook.router, prefix="/api", tags=["webhook"])
 
 _STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=_STATIC), name="static")

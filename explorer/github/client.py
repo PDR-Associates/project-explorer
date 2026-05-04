@@ -31,12 +31,16 @@ class GitHubClient:
             )
         return self._gh.get_repo(slug)
 
-    def download_zipball(self, repo: Repository, dest_dir: "Path") -> "Path":
+    def download_zipball(
+        self,
+        repo: Repository,
+        dest_dir: "Path",
+        subproject_path: str | None = None,
+    ) -> "Path":
         """
         Download entire repo as a single zipball (1 API call) and extract it.
-        Returns the extracted repo root directory inside dest_dir.
-        Far more rate-limit-friendly than fetching files individually.
-        Retries up to 3 times on transient network errors.
+        Returns the extracted repo root (or the subproject subdirectory when
+        subproject_path is specified).
         """
         import time
         import zipfile
@@ -88,15 +92,49 @@ class GitHubClient:
 
         # GitHub zips have a single top-level dir named "owner-repo-sha"
         subdirs = [d for d in Path(dest_dir).iterdir() if d.is_dir()]
-        return subdirs[0] if subdirs else Path(dest_dir)
+        repo_root = subdirs[0] if subdirs else Path(dest_dir)
+
+        if subproject_path:
+            sub = repo_root / subproject_path
+            if not sub.is_dir():
+                raise ValueError(
+                    f"Subproject path '{subproject_path}' does not exist in this repository. "
+                    f"Available top-level directories: "
+                    f"{[d.name for d in repo_root.iterdir() if d.is_dir()]}"
+                )
+            return sub
+
+        return repo_root
 
     def list_files(self, repo: Repository, path: str = "", recursive: bool = True) -> list[str]:
-        """Return all file paths via git tree (1 API call). Kept for stats/incremental use."""
+        """Return all file paths via git tree. Handles large repos where the recursive tree is truncated."""
         try:
             tree = repo.get_git_tree(repo.default_branch, recursive=True)
-            return [e.path for e in tree.tree if e.type == "blob"]
+            if not tree.truncated:
+                return [e.path for e in tree.tree if e.type == "blob"]
+            # Truncated response is cut off mid-traversal — its entry list is incomplete.
+            # Fetch root non-recursively to get all top-level entries, then walk each subtree.
+            root = repo.get_git_tree(repo.default_branch, recursive=False)
+            return self._list_files_walk(repo, root, "")
         except Exception:
             return []
+
+    def _list_files_walk(self, repo: Repository, tree, prefix: str) -> list[str]:
+        """Recursively collect file paths by fetching each subtree entry individually."""
+        paths = [e.path for e in tree.tree if e.type == "blob"]
+        for entry in tree.tree:
+            if entry.type != "tree":
+                continue
+            entry_prefix = f"{prefix}/{entry.name}" if prefix else entry.name
+            try:
+                subtree = repo.get_git_tree(entry.sha, recursive=True)
+                if not subtree.truncated:
+                    paths.extend(f"{entry_prefix}/{e.path}" for e in subtree.tree if e.type == "blob")
+                else:
+                    paths.extend(self._list_files_walk(repo, subtree, entry_prefix))
+            except Exception:
+                pass
+        return paths
 
     def get_file_content(self, repo: Repository, path: str) -> str | None:
         try:

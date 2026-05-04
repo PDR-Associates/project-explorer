@@ -75,6 +75,34 @@ class ConversationAgent(BaseExplorerAgent):
             )
         return self._agent
 
+    def load_history(self, turns: list[dict]) -> None:
+        """Pre-populate the agent's TokenMemory from a list of saved turns.
+
+        Each dict must have 'role' ('user'|'assistant') and 'content' keys.
+        Silently skips if BeeAI is unavailable or memory injection fails.
+        """
+        if not turns:
+            return
+        try:
+            from beeai_framework.backend.message import AssistantMessage, UserMessage
+
+            async def _inject() -> None:
+                agent = self._get_agent()
+                for turn in turns:
+                    if turn["role"] == "user":
+                        await agent.memory.add(UserMessage(turn["content"]))
+                    else:
+                        await agent.memory.add(AssistantMessage(turn["content"]))
+
+            try:
+                asyncio.get_running_loop()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    ex.submit(lambda: asyncio.run(_inject())).result(timeout=10)
+            except RuntimeError:
+                asyncio.run(_inject())
+        except Exception:
+            pass
+
     def handle(self, query: str, project_slug: str | None = None, **kwargs) -> str:
         slug = project_slug or self.project_slug or self._infer_project_slug(query)
 

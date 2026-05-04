@@ -133,14 +133,7 @@ def query_top_committers(project_slug: str, limit: int = 10) -> str:
     return "\n".join(lines)
 
 
-@tool(description=(
-    "List or count classes, functions, methods, and interfaces defined in a project's source code. "
-    "kind filters by symbol type: 'class', 'function', 'method', 'interface', 'enum', or 'all' (default). "
-    "pattern filters by name substring (case-insensitive). "
-    "file_path restricts to a specific file or directory prefix. "
-    "Returns qualified name, signature, and docstring for each match."
-))
-def query_code_symbols(
+def _query_code_symbols_raw(
     project_slug: str,
     kind: str = "all",
     pattern: str = "",
@@ -195,6 +188,24 @@ def query_code_symbols(
         lines.append(f"\n[{r['kind']}] {r['qualified_name']}{sig}")
         lines.append(f"  {r['file_path']}:{r['start_line']}{doc}")
     return "\n".join(lines)
+
+
+@tool(description=(
+    "List or count classes, functions, methods, and interfaces defined in a project's source code. "
+    "kind filters by symbol type: 'class', 'function', 'method', 'interface', 'enum', or 'all' (default). "
+    "pattern filters by name substring (case-insensitive). "
+    "file_path restricts to a specific file or directory prefix. "
+    "Returns qualified name, signature, and docstring for each match."
+))
+def query_code_symbols(
+    project_slug: str,
+    kind: str = "all",
+    pattern: str = "",
+    file_path: str = "",
+    limit: int = 50,
+) -> str:
+    return _query_code_symbols_raw(project_slug, kind=kind, pattern=pattern,
+                                   file_path=file_path, limit=limit)
 
 
 @tool(description=(
@@ -419,3 +430,122 @@ def query_contributor_profile(project_slug: str, author: str, days: int = 90) ->
         return "\n".join(lines)
     except Exception as exc:
         return f"Error: {exc}"
+
+
+def _build_example_context_raw(project_slug: str, topic: str) -> str:
+    from explorer.multi_collection_store import MultiCollectionStore
+    from explorer.registry import ProjectRegistry
+
+    registry = ProjectRegistry()
+    slug = registry._normalize_slug(project_slug)
+
+    collection_types = ["examples", "python_code", "api_reference", "markdown_docs"]
+    candidate_collections = [f"{slug}_{ctype}" for ctype in collection_types]
+
+    store = MultiCollectionStore()
+    client = store._get_client()
+    existing = [c for c in candidate_collections if client.has_collection(c)]
+    if not existing:
+        return f"No indexed collections found for '{slug}'. Run: project-explorer add/refresh {slug}"
+
+    # Targeted searches: topic itself, import/setup patterns, usage examples
+    pkg = slug.replace("_", " ")
+    searches = [
+        (topic, existing, 3),
+        (f"from {slug} import", existing, 2),
+        (f"import {slug} setup {pkg}", existing, 2),
+        ("usage example how to", [c for c in existing if any(t in c for t in ("examples", "markdown"))], 2),
+    ]
+
+    seen: set[str] = set()
+    sections: list[str] = []
+    for query_text, cols, top_k in searches:
+        if not cols:
+            continue
+        for r in store.search(query_text, cols, top_k=top_k):
+            if r.text not in seen and r.score >= 0.3:
+                seen.add(r.text)
+                sections.append(f"[{r.collection} | score={r.score:.2f}]\n{r.text}")
+
+    if not sections:
+        return (
+            f"No relevant context found for '{topic}' in '{slug}'. "
+            "The project may need re-indexing, or try a broader topic."
+        )
+
+    # Extract class names that appear as constructors or type annotations in the
+    # retrieved chunks and prepend a concrete import hint.  This compensates for
+    # the import chunk rarely scoring high enough to be retrieved on its own.
+    import re as _re
+    combined = "\n".join(sections)
+    class_names = _re.findall(r'\b([A-Z][A-Za-z0-9]+)\s*\(', combined)
+    known_classes = sorted({
+        n for n in class_names
+        if n not in {"True", "False", "None"} and not n[0].isdigit()
+    })
+    import_hint = ""
+    if known_classes:
+        import_hint = (
+            f"IMPORT HINT: These classes come from the '{slug}' package.\n"
+            f"  from {slug} import {', '.join(known_classes[:6])}\n\n"
+        )
+
+    header = f"Context for: '{topic}' in {slug}\n{'=' * 60}\n\n{import_hint}"
+    return header + "\n\n---\n\n".join(sections)
+
+
+@tool(description=(
+    "Gather context for generating a Python code example about a specific topic. "
+    "Searches the examples, python_code, api_reference, and markdown_docs collections "
+    "and returns relevant snippets ready for code generation. "
+    "topic should be a concrete task: e.g. 'connect to server', 'list metadata assets', "
+    "'create a glossary term', 'authenticate with token'. "
+    "Call multiple times with different topics to gather broader context."
+))
+def build_example_context(project_slug: str, topic: str) -> str:
+    return _build_example_context_raw(project_slug, topic)
+
+
+@tool(description=(
+    "Query the dependency graph for a project. Returns a markdown table of dependencies. "
+    "dep_type can be 'runtime', 'dev', 'optional', 'indirect', 'test', or 'all' (default). "
+    "Pass a comma-separated list of project_slugs to find shared dependencies across projects."
+))
+def query_dependencies(project_slug: str, dep_type: str = "all") -> str:
+    from explorer.registry import ProjectRegistry
+    registry = ProjectRegistry()
+    slugs = [s.strip() for s in project_slug.split(",") if s.strip()]
+    if not slugs:
+        return "No project slug provided."
+
+    if len(slugs) == 1:
+        slug = slugs[0]
+        deps = registry.query_dependencies(slug, dep_type=dep_type if dep_type != "all" else None)
+        if not deps:
+            return (
+                f"No dependencies found for '{slug}'. "
+                f"Run 'project-explorer refresh {slug}' to index them."
+            )
+        lines = [
+            f"Dependencies for **{slug}** (filter: {dep_type}):", "",
+            "| Package | Version | Type | Ecosystem | Source |",
+            "|---------|---------|------|-----------|--------|",
+        ]
+        for d in deps:
+            lines.append(
+                f"| {d['dep_name']} | {d['dep_version'] or '—'} | "
+                f"{d['dep_type']} | {d['ecosystem']} | {d['source_file']} |"
+            )
+        return "\n".join(lines)
+
+    shared = registry.query_shared_dependencies(slugs)
+    if not shared:
+        return f"No shared dependencies found across: {', '.join(slugs)}"
+    lines = [
+        f"Shared dependencies across {', '.join(slugs)}:", "",
+        "| Package | Ecosystem | Projects |",
+        "|---------|-----------|---------|",
+    ]
+    for d in shared:
+        lines.append(f"| {d['dep_name']} | {d['ecosystem']} | {d['projects']} |")
+    return "\n".join(lines)

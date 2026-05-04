@@ -38,6 +38,14 @@ def _get_or_create_session(session_id: str, project_slug: str | None):
 
     if session_id not in _sessions:
         agent = ConversationAgent(project_slug=project_slug)
+        # Hydrate memory from persisted history so context survives restarts
+        try:
+            from explorer.registry import ProjectRegistry
+            turns = ProjectRegistry().load_turns(session_id)
+            if turns:
+                agent.load_history(turns)
+        except Exception:
+            pass
         _sessions[session_id] = (agent, now)
     else:
         agent, _ = _sessions[session_id]
@@ -46,6 +54,16 @@ def _get_or_create_session(session_id: str, project_slug: str | None):
             agent.project_slug = project_slug
 
     return agent
+
+
+def _persist_turn(session_id: str, query: str, response: str, project_slug: str | None) -> None:
+    try:
+        from explorer.registry import ProjectRegistry
+        registry = ProjectRegistry()
+        registry.append_turn(session_id, "user", query, project_slug)
+        registry.append_turn(session_id, "assistant", response, project_slug)
+    except Exception:
+        pass
 
 
 class QueryRequest(BaseModel):
@@ -120,6 +138,7 @@ async def ask(request: QueryRequest) -> QueryResponse:
     if request.session_id:
         agent = _get_or_create_session(request.session_id, request.project_slug)
         response = agent.handle(request.query, project_slug=request.project_slug)
+        _persist_turn(request.session_id, request.query, response, request.project_slug)
     else:
         from explorer.rag_system import RAGSystem
         response = RAGSystem().query(request.query, project_slug=request.project_slug)
@@ -159,6 +178,7 @@ async def stream(request: QueryRequest) -> StreamingResponse:
                     intent = QueryProcessor().classify(request.query).value
                     agent = _get_or_create_session(request.session_id, request.project_slug)
                     text = agent.handle(request.query, project_slug=request.project_slug)
+                    _persist_turn(request.session_id, request.query, text, request.project_slug)
                     loop.call_soon_threadsafe(queue.put_nowait, text)
                     loop.call_soon_threadsafe(queue.put_nowait, {"_done": True, "intent": intent, "hash": hashlib.sha256(request.query.encode()).hexdigest()[:16], "cached": False})
                 else:

@@ -30,38 +30,61 @@ class IngestionPipeline:
         self.store = MultiCollectionStore()
         self.console = Console()
 
+    # Collection types that can ingest from extra_docs_paths
+    _DOC_CTYPES: frozenset[str] = frozenset({
+        "markdown_docs", "web_docs", "api_reference", "examples", "pdfs",
+    })
+
     def run(
         self,
         project_slug: str,
         github_url: str,
         collection_types: list[CollectionType],
+        subproject_path: str | None = None,
+        extra_docs_paths: list[str] | None = None,
+        local_path: str | None = None,
     ) -> None:
         from explorer.github.client import GitHubClient
 
         self.registry.update_status(project_slug, ProjectStatus.INDEXING)
-        active_collections = []
+        active_collections: list[str] = []
+        extra_docs_paths = extra_docs_paths or []
 
         client = GitHubClient()
         repo = client.get_repo(github_url)
 
         try:
-            with tempfile.TemporaryDirectory() as tmp:
-                self.console.print("[cyan]Downloading repository...[/cyan]")
-                local_root = client.download_zipball(repo, Path(tmp))
-                self.console.print(f"[cyan]Extracted to {local_root.name}[/cyan]")
-
-                with Progress(console=self.console) as progress:
-                    task = progress.add_task("Ingesting...", total=len(collection_types))
-                    for ctype in collection_types:
-                        collection_name = f"{project_slug}_{ctype.name}"
-                        count = self._ingest_collection(
-                            repo, project_slug, collection_name, ctype, local_root
+            if local_path:
+                full_root = Path(local_path).expanduser().resolve()
+                if not full_root.is_dir():
+                    raise ValueError(f"--from-local path is not a directory: {full_root}")
+                self.console.print(f"[cyan]Using local path {full_root}[/cyan]")
+                code_root, resolved_extra = self._setup_roots(full_root, subproject_path, extra_docs_paths)
+                file_count, loc = self._ingest_from_root(
+                    project_slug, repo, collection_types, code_root, resolved_extra, active_collections
+                )
+            else:
+                with tempfile.TemporaryDirectory() as tmp:
+                    self.console.print("[cyan]Downloading repository...[/cyan]")
+                    if extra_docs_paths:
+                        # Must download full repo to reach paths outside the subproject
+                        extracted = client.download_zipball(repo, Path(tmp))
+                        self.console.print(f"[cyan]Extracted to {extracted.name}[/cyan]")
+                        code_root, resolved_extra = self._setup_roots(
+                            extracted, subproject_path, extra_docs_paths
                         )
-                        if count > 0:
-                            active_collections.append(collection_name)
-                        progress.advance(task)
+                    else:
+                        # Subpath filter saves bandwidth; download_zipball returns the subdir directly
+                        extracted = client.download_zipball(repo, Path(tmp), subproject_path or None)
+                        self.console.print(f"[cyan]Extracted to {extracted.name}[/cyan]")
+                        code_root = extracted
+                        resolved_extra = []
+                    file_count, loc = self._ingest_from_root(
+                        project_slug, repo, collection_types, code_root, resolved_extra, active_collections
+                    )
 
             self.registry.update_indexed_at(project_slug, active_collections)
+            self.registry.update_ingestion_stats(project_slug, file_count, loc)
             self.registry.update_status(project_slug, ProjectStatus.ACTIVE)
             self.console.print(
                 f"[green]Ingestion complete. {len(active_collections)} collections populated.[/green]"
@@ -71,6 +94,48 @@ class IngestionPipeline:
             self.registry.update_status(project_slug, ProjectStatus.ERROR, str(e))
             raise
 
+    def _setup_roots(
+        self,
+        full_root: Path,
+        subproject_path: str | None,
+        extra_docs_paths: list[str],
+    ) -> tuple[Path, list[tuple[str, Path]]]:
+        """Derive (code_root, resolved_extra) from a repo root (downloaded or local)."""
+        if subproject_path:
+            code_root = full_root / subproject_path
+            resolved_extra = [(p, full_root / p) for p in extra_docs_paths]
+        else:
+            code_root = full_root
+            resolved_extra = []
+        return code_root, resolved_extra
+
+    def _ingest_from_root(
+        self,
+        project_slug: str,
+        repo,
+        collection_types: list[CollectionType],
+        code_root: Path,
+        resolved_extra: list[tuple[str, Path]],
+        active_collections: list[str],
+    ) -> tuple[int, int]:
+        """Run the ingestion loop over collection_types; return (file_count, loc)."""
+        with Progress(console=self.console) as progress:
+            task = progress.add_task("Ingesting...", total=len(collection_types))
+            for ctype in collection_types:
+                collection_name = f"{project_slug}_{ctype.name}"
+                extra = resolved_extra if ctype.name in self._DOC_CTYPES else []
+                count = self._ingest_collection(
+                    repo, project_slug, collection_name, ctype, code_root,
+                    extra_paths=extra,
+                )
+                if count > 0:
+                    active_collections.append(collection_name)
+                progress.advance(task)
+
+        file_count, loc = self._count_repo_stats(code_root)
+        self._parse_dependencies(project_slug, code_root)
+        return file_count, loc
+
     def _ingest_collection(
         self,
         repo,
@@ -78,24 +143,31 @@ class IngestionPipeline:
         collection_name: str,
         ctype: CollectionType,
         local_root: Path | None = None,
+        extra_paths: list[tuple[str, Path]] | None = None,
     ) -> int:
         """
         Ingest one collection type. local_root is the extracted repo directory;
         if None (incremental single-collection re-index), downloads on the spot.
+        extra_paths is a list of (display_prefix, abs_path) for repo paths outside
+        the code subproject; used by doc/example collections only.
         """
         from explorer.ingestion.data_prep import DataPrep
 
-        _file_dispatch = {
+        _code_dispatch = {
             "python_code": self._ingest_code,
             "javascript_code": self._ingest_code,
             "java_code": self._ingest_code,
             "go_code": self._ingest_code,
+        }
+        _doc_dispatch = {
             "markdown_docs": self._ingest_markdown,
             "web_docs": self._ingest_web_docs,
             "api_reference": self._ingest_api_specs,
             "examples": self._ingest_examples,
             "pdfs": self._ingest_pdfs,
         }
+        _file_dispatch = {**_code_dispatch, **_doc_dispatch}
+        extra_paths = extra_paths or []
 
         if ctype.name != "release_notes" and ctype.name not in _file_dispatch:
             return 0
@@ -111,6 +183,8 @@ class IngestionPipeline:
                 with tempfile.TemporaryDirectory() as tmp:
                     local_root = client.download_zipball(repo, Path(tmp))
                     chunks = _file_dispatch[ctype.name](local_root, project_slug, ctype)
+            elif ctype.name in self._DOC_CTYPES and extra_paths:
+                chunks = _doc_dispatch[ctype.name](local_root, project_slug, ctype, extra_paths)
             else:
                 chunks = _file_dispatch[ctype.name](local_root, project_slug, ctype)
 
@@ -163,7 +237,39 @@ class IngestionPipeline:
 
         return total
 
+    def _parse_dependencies(self, project_slug: str, local_root: Path) -> None:
+        try:
+            from explorer.ingestion.dependency_parser import DependencyParser
+            deps = DependencyParser().parse(local_root, project_slug)
+            if deps:
+                self.registry.upsert_dependencies(project_slug, deps)
+                self.console.print(f"[dim]Dependencies: {len(deps)} entries indexed.[/dim]")
+        except Exception as exc:
+            self.console.print(f"[dim]Dependency parsing skipped: {exc}[/dim]")
+
     # ── local file helpers ────────────────────────────────────────────────────
+
+    _TEXT_SUFFIXES: frozenset[str] = frozenset({
+        ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs",
+        ".rb", ".cpp", ".c", ".h", ".cs", ".swift", ".kt", ".scala",
+        ".r", ".md", ".rst", ".txt", ".yaml", ".yml", ".json", ".toml",
+        ".html", ".css", ".sh", ".bash", ".sql", ".xml",
+    })
+
+    def _count_repo_stats(self, local_root: Path) -> tuple[int, int]:
+        """Return (file_count, line_count) by walking the extracted repo directory."""
+        file_count = 0
+        line_count = 0
+        for p in local_root.rglob("*"):
+            if not p.is_file():
+                continue
+            file_count += 1
+            if p.suffix.lower() in self._TEXT_SUFFIXES:
+                try:
+                    line_count += p.read_bytes().count(b"\n")
+                except Exception:
+                    pass
+        return file_count, line_count
 
     def _local_files(self, local_root: Path, extensions: list[str]) -> list[tuple[str, str]]:
         """Walk the extracted repo and return (relative_path, content) for matching files."""
@@ -178,6 +284,36 @@ class IngestionPipeline:
                 results.append((str(p.relative_to(local_root)), content))
             except Exception:
                 pass
+        return results
+
+    def _local_files_for_paths(
+        self,
+        extra: list[tuple[str, Path]],
+        extensions: list[str],
+    ) -> list[tuple[str, str]]:
+        """
+        Return (display_path, content) for extra_docs_paths entries.
+        Each entry is (display_prefix, abs_path) where abs_path may be a file or directory.
+        """
+        results = []
+        for display_prefix, abs_path in extra:
+            if abs_path.is_file():
+                if abs_path.suffix.lower() in extensions:
+                    try:
+                        content = abs_path.read_text(encoding="utf-8", errors="ignore")
+                        results.append((display_prefix, content))
+                    except Exception:
+                        pass
+            elif abs_path.is_dir():
+                for f in abs_path.rglob("*"):
+                    if not f.is_file() or f.suffix.lower() not in extensions:
+                        continue
+                    try:
+                        content = f.read_text(encoding="utf-8", errors="ignore")
+                        rel = display_prefix.rstrip("/") + "/" + str(f.relative_to(abs_path))
+                        results.append((rel, content))
+                    except Exception:
+                        pass
         return results
 
     # ── per-collection-type ingestors ─────────────────────────────────────────
@@ -213,20 +349,32 @@ class IngestionPipeline:
 
         return chunks
 
-    def _ingest_markdown(self, local_root: Path, project_slug: str, ctype: CollectionType) -> list:
+    def _ingest_markdown(
+        self, local_root: Path, project_slug: str, ctype: CollectionType,
+        extra_paths: list[tuple[str, Path]] | None = None,
+    ) -> list:
         from explorer.ingestion.doc_parser import DocParser
         parser = DocParser(ctype.chunk_size, ctype.chunk_overlap)
         chunks = []
         for path, content in self._local_files(local_root, ctype.file_extensions):
             chunks.extend(parser.parse_markdown(content, path, project_slug))
+        for path, content in self._local_files_for_paths(extra_paths or [], ctype.file_extensions):
+            chunks.extend(parser.parse_markdown(content, path, project_slug))
         return chunks
 
-    def _ingest_web_docs(self, local_root: Path, project_slug: str, ctype: CollectionType) -> list:
+    def _ingest_web_docs(
+        self, local_root: Path, project_slug: str, ctype: CollectionType,
+        extra_paths: list[tuple[str, Path]] | None = None,
+    ) -> list:
         import re
         from explorer.ingestion.doc_parser import DocChunk, DocParser
         parser = DocParser(ctype.chunk_size, ctype.chunk_overlap)
         chunks = []
-        for path, content in self._local_files(local_root, ctype.file_extensions):
+        all_files = (
+            self._local_files(local_root, ctype.file_extensions)
+            + self._local_files_for_paths(extra_paths or [], ctype.file_extensions)
+        )
+        for path, content in all_files:
             text = re.sub(r"<[^>]+>", " ", content)
             text = re.sub(r"\s+", " ", text).strip()
             for chunk_text in parser._fixed_window(text):
@@ -236,26 +384,39 @@ class IngestionPipeline:
                 ))
         return chunks
 
-    def _ingest_api_specs(self, local_root: Path, project_slug: str, ctype: CollectionType) -> list:
+    def _ingest_api_specs(
+        self, local_root: Path, project_slug: str, ctype: CollectionType,
+        extra_paths: list[tuple[str, Path]] | None = None,
+    ) -> list:
         from explorer.ingestion.api_parser import APIParser
         parser = APIParser()
         chunks = []
-        for path, content in self._local_files(local_root, ctype.file_extensions):
+        all_files = (
+            self._local_files(local_root, ctype.file_extensions)
+            + self._local_files_for_paths(extra_paths or [], ctype.file_extensions)
+        )
+        for path, content in all_files:
             parsed = parser.parse(path, content, project_slug)
             if parsed:
                 chunks.extend(parsed)
         return chunks
 
-    def _ingest_examples(self, local_root: Path, project_slug: str, ctype: CollectionType) -> list:
+    def _ingest_examples(
+        self, local_root: Path, project_slug: str, ctype: CollectionType,
+        extra_paths: list[tuple[str, Path]] | None = None,
+    ) -> list:
         from explorer.ingestion.code_parser import CodeParser
         from explorer.ingestion.notebook_parser import NotebookParser
+        import os
         code_parser = CodeParser(ctype.chunk_size, ctype.chunk_overlap)
         nb_parser = NotebookParser()
         chunks = []
-        for path, content in self._local_files(local_root, ctype.file_extensions):
+        all_files = (
+            self._local_files(local_root, ctype.file_extensions)
+            + self._local_files_for_paths(extra_paths or [], ctype.file_extensions)
+        )
+        for path, content in all_files:
             if path.endswith(".ipynb"):
-                # NotebookParser needs a file path; write to a temp file
-                import tempfile, os
                 with tempfile.NamedTemporaryFile(mode="w", suffix=".ipynb", delete=False) as f:
                     f.write(content)
                     tmp = f.name
@@ -267,7 +428,10 @@ class IngestionPipeline:
                 chunks.extend(code_parser.parse(path, content, project_slug))
         return chunks
 
-    def _ingest_pdfs(self, local_root: Path, project_slug: str, ctype: CollectionType) -> list:
+    def _ingest_pdfs(
+        self, local_root: Path, project_slug: str, ctype: CollectionType,
+        extra_paths: list[tuple[str, Path]] | None = None,
+    ) -> list:
         from explorer.ingestion.doc_parser import DocParser
         parser = DocParser(ctype.chunk_size, ctype.chunk_overlap)
         chunks = []
@@ -276,6 +440,18 @@ class IngestionPipeline:
                 chunks.extend(parser.parse_pdf(str(path), project_slug))
             except Exception:
                 pass
+        for _display, abs_path in (extra_paths or []):
+            if abs_path.is_file() and abs_path.suffix.lower() == ".pdf":
+                try:
+                    chunks.extend(parser.parse_pdf(str(abs_path), project_slug))
+                except Exception:
+                    pass
+            elif abs_path.is_dir():
+                for pdf in abs_path.rglob("*.pdf"):
+                    try:
+                        chunks.extend(parser.parse_pdf(str(pdf), project_slug))
+                    except Exception:
+                        pass
         return chunks
 
     def _ingest_releases(self, repo, project_slug: str, ctype: CollectionType) -> list:

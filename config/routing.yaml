@@ -24,6 +24,19 @@ intent_patterns:
       - "activity (over|in|last|this)"
       - "weekly|monthly (commits|activity|contributions)"
 
+  dependency:
+    priority: HIGH
+    description: Questions about project dependencies, packages, requirements
+    patterns:
+      - 'go\.mod|pyproject\.toml|package\.json|requirements\.txt'
+      - 'shared dep'
+      - '(list|show|what are).{0,30}(dep|package|librar|requirement)'
+      - 'what.{0,40}(use|require|depend on|import).{0,20}(package|librar|dep|module)'
+      - '(package|librar|dep).{0,30}(use|require|need|depend)'
+      - '(runtime|dev|optional|indirect)\s+dep'
+      - 'which projects?.{0,20}(use|depend on|require|import)'
+      - 'what (package|librar|dep|requirement|module)'
+
   integration:
     priority: HIGH
     description: Ecosystem fit, interoperability, and cross-project integration
@@ -78,6 +91,20 @@ intent_patterns:
       - '(class|method|function|interface) (called|named) .+'
       - 'count (class\w*|method\w*|function\w*)'
       - 'find (class|method|function) .+'
+
+  examples:
+    priority: NORMAL
+    description: Requests to generate complete, runnable code examples for a project
+    patterns:
+      - 'generate (a |an |me |some )?(python )?(example|sample|snippet|code|demo)'
+      - 'write (me )?(a |an )?(python )?(example|code|script|snippet|demo)'
+      - 'give (me )?(a |an )?(python )?(example|demo|sample|working example)'
+      - '(show me|how do i|how to|can you show).{0,40}(in python|using python|with python)'
+      - 'code (example|sample|snippet|demo) (for|to|showing|that|using)'
+      - 'sample (code|program|script|notebook) (for|to|that|showing)'
+      - 'working (code )?(example|demo|sample)'
+      - 'example (of how to|showing how to|that demonstrates|for using|for calling)'
+      - '(create|build|write).{0,30}python.{0,30}(script|program|example|sample)'
 
   code_search:
     priority: NORMAL

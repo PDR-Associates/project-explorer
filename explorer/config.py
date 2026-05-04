@@ -54,6 +54,7 @@ class CacheConfig(BaseSettings):
 
 class GitHubConfig(BaseSettings):
     token: str = Field(default="", alias="GITHUB_TOKEN")
+    webhook_secret: str = Field(default="", alias="GITHUB_WEBHOOK_SECRET")
     requests_per_hour: int = 5000
     clone_timeout_seconds: int = 300
     ssl_verify: bool = True  # set GITHUB__SSL_VERIFY=false in .env to bypass (insecure)

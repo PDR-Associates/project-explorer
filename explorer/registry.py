@@ -33,6 +33,9 @@ class Project:
     last_commit_sha: str = ""
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
     error_message: str = ""
+    subproject_path: str = ""   # relative subdir to index, e.g. "commands" — "" means full repo
+    parent_slug: str = ""       # slug of the parent project when this is a sub-project
+    extra_docs_paths: list[str] = field(default_factory=list)  # repo-relative paths outside subproject_path to ingest as docs/examples
 
 
 class ProjectRegistry:
@@ -68,13 +71,22 @@ class ProjectRegistry:
                     last_stats_fetched_at TEXT DEFAULT '',
                     last_commit_sha TEXT DEFAULT '',
                     created_at TEXT NOT NULL,
-                    error_message TEXT DEFAULT ''
+                    error_message TEXT DEFAULT '',
+                    subproject_path TEXT DEFAULT '',
+                    parent_slug TEXT DEFAULT '',
+                    extra_docs_paths TEXT DEFAULT '[]'
                 )
             """)
-            # Migration: add last_commit_sha to existing databases
+            # Migrations: add new columns to existing databases
             existing = {r[1] for r in conn.execute("PRAGMA table_info(projects)")}
-            if "last_commit_sha" not in existing:
-                conn.execute("ALTER TABLE projects ADD COLUMN last_commit_sha TEXT DEFAULT ''")
+            for col, defn in [
+                ("last_commit_sha", "TEXT DEFAULT ''"),
+                ("subproject_path", "TEXT DEFAULT ''"),
+                ("parent_slug", "TEXT DEFAULT ''"),
+                ("extra_docs_paths", "TEXT DEFAULT '[]'"),
+            ]:
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE projects ADD COLUMN {col} {defn}")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS project_stats (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,6 +124,9 @@ class ProjectRegistry:
                 ("topics", "TEXT DEFAULT ''"),
                 ("repo_created_at", "TEXT DEFAULT ''"),
                 ("last_pushed_at", "TEXT DEFAULT ''"),
+                ("ingestion_file_count", "INTEGER DEFAULT NULL"),
+                ("ingestion_lines_of_code", "INTEGER DEFAULT NULL"),
+                ("commits_365d", "INTEGER DEFAULT NULL"),
             ]:
                 if col not in existing_stats:
                     conn.execute(f"ALTER TABLE project_stats ADD COLUMN {col} {defn}")
@@ -191,9 +206,49 @@ class ProjectRegistry:
                 "CREATE INDEX IF NOT EXISTS idx_contributor_stats_slug "
                 "ON project_contributor_stats(project_slug, period_start)"
             )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    turn_idx INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    project_slug TEXT DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conv_session "
+                "ON conversation_history(session_id, turn_idx)"
+            )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS project_dependencies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_slug TEXT NOT NULL,
+                    dep_name TEXT NOT NULL,
+                    dep_version TEXT DEFAULT '',
+                    dep_type TEXT DEFAULT 'runtime',
+                    ecosystem TEXT DEFAULT '',
+                    source_file TEXT DEFAULT '',
+                    indexed_at TEXT NOT NULL,
+                    FOREIGN KEY (project_slug) REFERENCES projects(slug)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_deps_slug "
+                "ON project_dependencies(project_slug)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_deps_name "
+                "ON project_dependencies(dep_name)"
+            )
 
     def add(self, project: Project) -> None:
-        data = {**asdict(project), "collections": json.dumps(project.collections)}
+        data = {
+            **asdict(project),
+            "collections": json.dumps(project.collections),
+            "extra_docs_paths": json.dumps(project.extra_docs_paths),
+        }
         data["slug"] = self._normalize_slug(data["slug"])
         with self._conn() as conn:
             conn.execute(
@@ -201,7 +256,8 @@ class ProjectRegistry:
                     :slug, :display_name, :github_url, :description, :homepage_url,
                     :docs_url, :github_token_encrypted, :collections, :status,
                     :last_indexed_at, :last_stats_fetched_at, :last_commit_sha,
-                    :created_at, :error_message
+                    :created_at, :error_message, :subproject_path, :parent_slug,
+                    :extra_docs_paths
                 )""",
                 data,
             )
@@ -237,6 +293,14 @@ class ProjectRegistry:
                 (datetime.utcnow().isoformat(), json.dumps(collections), slug),
             )
 
+    def update_extra_docs_paths(self, slug: str, paths: list[str]) -> None:
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE projects SET extra_docs_paths = ? WHERE slug = ?",
+                (json.dumps(paths), slug),
+            )
+
     def update_commit_sha(self, slug: str, sha: str) -> None:
         slug = self._normalize_slug(slug)
         with self._conn() as conn:
@@ -244,6 +308,26 @@ class ProjectRegistry:
                 "UPDATE projects SET last_commit_sha = ? WHERE slug = ?",
                 (sha, slug),
             )
+
+    def update_ingestion_stats(self, slug: str, file_count: int, lines_of_code: int) -> None:
+        """Update the most recent project_stats row with counts from actual ingestion."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id FROM project_stats WHERE project_slug = ? ORDER BY id DESC LIMIT 1",
+                (slug,),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE project_stats SET ingestion_file_count = ?, ingestion_lines_of_code = ? WHERE id = ?",
+                    (file_count, lines_of_code, row["id"]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO project_stats (project_slug, fetched_at, ingestion_file_count, ingestion_lines_of_code) "
+                    "VALUES (?, ?, ?, ?)",
+                    (slug, datetime.utcnow().isoformat(), file_count, lines_of_code),
+                )
 
     def upsert_code_symbols(self, project_slug: str, symbols: list) -> None:
         """Insert or replace extracted code symbols. symbols is a list of CodeSymbol dataclasses."""
@@ -386,11 +470,123 @@ class ProjectRegistry:
                     return display_term, candidates[matches[0]]
         return None
 
+    # ── dependency graph ──────────────────────────────────────────────────────
+
+    def upsert_dependencies(self, slug: str, deps: list[dict]) -> None:
+        """Store parsed dependency list for a project, replacing any prior data."""
+        if not deps:
+            return
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM project_dependencies WHERE project_slug = ?", (slug,)
+            )
+            conn.executemany(
+                "INSERT INTO project_dependencies "
+                "(project_slug, dep_name, dep_version, dep_type, ecosystem, source_file, indexed_at) "
+                "VALUES (:project_slug, :dep_name, :dep_version, :dep_type, :ecosystem, :source_file, :indexed_at)",
+                [{**d, "project_slug": slug, "indexed_at": datetime.utcnow().isoformat()} for d in deps],
+            )
+
+    def query_dependencies(
+        self,
+        slug: str,
+        dep_type: str | None = None,
+        ecosystem: str | None = None,
+    ) -> list[dict]:
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            filters = ["project_slug = ?"]
+            params: list = [slug]
+            if dep_type and dep_type != "all":
+                filters.append("dep_type = ?")
+                params.append(dep_type)
+            if ecosystem:
+                filters.append("ecosystem = ?")
+                params.append(ecosystem)
+            where = " AND ".join(filters)
+            rows = conn.execute(
+                f"SELECT dep_name, dep_version, dep_type, ecosystem, source_file "  # noqa: S608
+                f"FROM project_dependencies WHERE {where} ORDER BY ecosystem, dep_type, dep_name",
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def query_shared_dependencies(self, slugs: list[str], dep_name: str | None = None) -> list[dict]:
+        """Find dependencies shared across the given list of projects."""
+        norms = [self._normalize_slug(s) for s in slugs]
+        with self._conn() as conn:
+            placeholders = ",".join("?" * len(norms))
+            rows = conn.execute(
+                f"SELECT dep_name, ecosystem, GROUP_CONCAT(project_slug) as projects, COUNT(*) as project_count "  # noqa: S608
+                f"FROM project_dependencies WHERE project_slug IN ({placeholders}) "
+                f"GROUP BY dep_name, ecosystem HAVING project_count >= 2 ORDER BY project_count DESC, dep_name",
+                norms,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── conversation history ──────────────────────────────────────────────────
+
+    def append_turn(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        project_slug: str | None = None,
+    ) -> None:
+        """Append a single turn (user or assistant) to the conversation log."""
+        with self._conn() as conn:
+            next_idx = (
+                conn.execute(
+                    "SELECT COALESCE(MAX(turn_idx), -1) + 1 FROM conversation_history WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()[0]
+            )
+            conn.execute(
+                "INSERT INTO conversation_history (session_id, turn_idx, role, content, project_slug, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, next_idx, role, content, project_slug or "", datetime.utcnow().isoformat()),
+            )
+
+    def load_turns(self, session_id: str, limit: int = 40) -> list[dict]:
+        """Return up to `limit` most-recent turns for a session, in chronological order."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT role, content, project_slug FROM conversation_history "
+                "WHERE session_id = ? ORDER BY turn_idx DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    def list_sessions(self) -> list[dict]:
+        """Return a summary of all stored sessions (id, turn count, last activity)."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT session_id, COUNT(*) as turns, MAX(created_at) as last_at "
+                "FROM conversation_history GROUP BY session_id ORDER BY last_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_by_github_url(self, url: str) -> "Project | None":
+        """Look up a project by GitHub URL, normalizing away .git suffix and case."""
+        normalized = url.lower().rstrip("/").removesuffix(".git")
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM projects").fetchall()
+        for row in rows:
+            stored = row["github_url"].lower().rstrip("/").removesuffix(".git")
+            if stored == normalized:
+                return self._row_to_project(row)
+        return None
+
     def exists(self, slug: str) -> bool:
         return self.get(slug) is not None
 
     def _row_to_project(self, row: sqlite3.Row) -> Project:
+        import dataclasses
         d = dict(row)
         d["collections"] = json.loads(d.get("collections") or "[]")
+        d["extra_docs_paths"] = json.loads(d.get("extra_docs_paths") or "[]")
         d["status"] = ProjectStatus(d["status"])
-        return Project(**d)
+        # Filter to only known Project fields to stay forward-compatible with schema changes
+        known = {f.name for f in dataclasses.fields(Project)}
+        return Project(**{k: v for k, v in d.items() if k in known})

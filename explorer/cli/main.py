@@ -29,11 +29,30 @@ console = Console()
 def add(
     github_url: str = typer.Argument(help="GitHub repository URL to add"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Accept all proposed collections without prompting"),
+    subpath: Optional[str] = typer.Option(None, "--subpath", help="Index only this subdirectory (for monorepos)"),
+    name: Optional[str] = typer.Option(None, "--name", help="Project slug override (required when --subpath is used)"),
+    extra_docs_path: list[str] = typer.Option(
+        [], "--extra-docs-path",
+        help="Repo-relative path (file or directory) outside --subpath to ingest as docs/examples. "
+             "Repeat to add multiple paths, e.g. --extra-docs-path docs/guide.md --extra-docs-path examples/",
+    ),
+    from_local: Optional[str] = typer.Option(
+        None, "--from-local",
+        help="Path to a local clone of the repository. Skips the GitHub download — "
+             "useful when registering multiple sub-projects from the same repo.",
+    ),
 ):
     """Add a GitHub project (runs onboarding wizard to detect content and plan ingestion)."""
+    if subpath and not name:
+        console.print("[red]--name is required when using --subpath[/red]")
+        raise typer.Exit(1)
+    if extra_docs_path and not subpath:
+        console.print("[yellow]--extra-docs-path is only useful together with --subpath; ignoring.[/yellow]")
+        extra_docs_path = []
     from explorer.cli.wizard import OnboardingWizard
     wizard = OnboardingWizard()
-    wizard.run(github_url, accept_all=yes)
+    wizard.run(github_url, accept_all=yes, subproject_path=subpath, slug_override=name,
+               extra_docs_paths=extra_docs_path or None, local_path=from_local)
 
 
 @app.command()
@@ -94,10 +113,11 @@ def ask(
 @app.command()
 def chat(
     project: Optional[str] = typer.Option(None, "--project", "-p", help="Scope to a specific project slug"),
+    session_id: Optional[str] = typer.Option(None, "--session-id", "-s", help="Resume a previous session by ID"),
 ):
     """Start an interactive multi-turn chat session."""
     from explorer.cli.interactive import InteractiveSession
-    InteractiveSession(project_slug=project).run()
+    InteractiveSession(project_slug=project, session_id=session_id).run()
 
 
 @app.command(name="add-docs")
@@ -180,6 +200,10 @@ def _ingest_web_docs(project, docs_url: str, registry) -> None:
 def refresh(
     slug: str = typer.Argument(help="Project slug to re-index"),
     no_stats: bool = typer.Option(False, "--no-stats", help="Skip GitHub statistics update"),
+    history: int = typer.Option(
+        90, "--history", "-H",
+        help="Days of commit history to fetch (default: 90). Use 365 for a full year.",
+    ),
     symbols: bool = typer.Option(
         False, "--symbols",
         help="Extract (or re-extract) code symbols (classes, methods, functions) from source files. "
@@ -216,7 +240,7 @@ def refresh(
         console.print("[dim]Refreshing project statistics...[/dim]")
         try:
             from explorer.github.stats_fetcher import StatsFetcher
-            result = StatsFetcher().fetch(slug)
+            result = StatsFetcher().fetch(slug, lookback_days=history)
             if "commits_fetch_error" in result:
                 console.print(
                     f"[yellow]Warning:[/yellow] commit history could not be fetched: "
@@ -224,7 +248,7 @@ def refresh(
                 )
             else:
                 n = result.get("commits_fetched", 0)
-                console.print(f"[dim]Stats updated ({n} commits stored).[/dim]")
+                console.print(f"[dim]Stats updated ({n} commits stored, {history}d lookback).[/dim]")
         except Exception as exc:
             console.print(f"[dim]Stats update skipped: {exc}[/dim]")
 

@@ -55,6 +55,23 @@ External services required:
 # Add a GitHub project (triggers onboarding wizard)
 project-explorer add https://github.com/owner/repo
 
+# Add a monorepo sub-project (index only one subdirectory)
+project-explorer add https://github.com/owner/monorepo \
+    --subpath subdir --name myproject
+
+# Add a sub-project and include docs/examples that live outside the subpath
+project-explorer add https://github.com/owner/monorepo \
+    --subpath subdir --name myproject \
+    --extra-docs-path docs/guide.md \
+    --extra-docs-path examples/
+
+# Use a local clone to avoid downloading the same large repo for each sub-project
+# (GitHub URL is still stored for refresh and stats; --from-local only skips the initial download)
+project-explorer add https://github.com/owner/monorepo \
+    --subpath subdir --name myproject \
+    --extra-docs-path docs/guide.md \
+    --from-local /path/to/local/clone
+
 # List registered projects (shows collections and vector counts)
 project-explorer list
 project-explorer list --details   # full per-collection breakdown
@@ -109,6 +126,7 @@ User Query
   → QueryProcessor                ← classifies intent
       ├── statistical  → StatsAgent (GitHub API + SQLite time-series)
       ├── comparison   → CompareAgent (multi-project RAG + structured diff)
+      ├── examples     → ExamplesAgent (generates runnable Python code)
       ├── code_search  → CodeAgent (code collections)
       ├── conceptual   → DocAgent (markdown + web docs)
       ├── health       → HealthAgent (community metrics)
@@ -126,11 +144,15 @@ All agents follow the pattern validated in lfai/ML_LLM_Ops:
 - BeeAI uses the function docstring as description and the signature to generate a Pydantic schema
 - Middleware captures request/response/error per tool call → Phoenix
 
-Four shared tools in `agents/tools.py`:
+Tools in `agents/tools.py`:
 - `vector_search(query, collection_names)` — used by Code, Doc, Compare agents
 - `query_project_stats(project_slug)` — used by Stats, Health, Compare agents
 - `query_top_committers(project_slug, limit)` — used by Stats, Health agents
 - `query_commit_activity(project_slug)` — used by Stats agent
+- `query_code_symbols(project_slug, kind, pattern)` — used by CodeInventory, Examples agents
+- `get_symbol_detail(project_slug, name)` — used by CodeInventory, Examples agents
+- `build_example_context(project_slug, topic)` — used by ExamplesAgent; searches examples, python_code, api_reference, and markdown_docs collections in one call and returns formatted context for code generation
+- `query_dependencies(project_slug, dep_type)` — used by Dependency agent
 
 `BaseExplorerAgent` also provides:
 - `_infer_project_slug(query)` — infers project from query text against registry
@@ -199,6 +221,11 @@ Not every project gets every collection — `RepoAnalyzer` inspects the repo and
 7. `refresh` always updates stats and commit history unless `--no-stats` — agents need SQLite data to answer contributor/trend queries
 8. Use single-quoted YAML strings for regex patterns containing backslashes (`\w`, `\d`, etc.) — YAML double-quote mode treats `\` as escape and `\w` is invalid
 9. A2A `Server` supports exactly one agent per instance — run one server per agent, gather with `asyncio.gather()`
+10. GitHub's `get_git_tree(recursive=True)` is truncated for repos with >100k total nodes (files + directories combined) — when `tree.truncated` is set, the returned list is cut off mid-traversal and incomplete; fix by fetching the root **non-recursively** first (never truncated) then walking each top-level subtree individually
+11. Fetching per-commit `additions/deletions` costs one REST call per new commit — pre-check the rate limit before the diff-stats loop and re-check every 50 calls; disable diff stat fetching when fewer than 100 calls remain rather than hitting the wall mid-loop
+12. `--extra-docs-path` only has effect when `--subpath` is also set — without a subpath the full repo is already downloaded, so all paths are already covered; when both are set, the pipeline downloads the full repo and uses `code_root = full_root / subpath` for code collections while also walking the extra paths for doc/example collections
+13. `--from-local` skips the GitHub zipball download for the initial `add`; the GitHub URL is still stored in the registry and used for stats, incremental refresh, and webhook events — `--from-local` has no effect on `refresh`, which always re-downloads from GitHub
+14. BeeAI `FunctionTool` objects (produced by `@tool`) have no `.func` attribute — calling `my_tool.func(...)` raises `AttributeError`. To call tool logic outside the agent loop (e.g., in a `_fallback()` method), extract the implementation into a `_<name>_raw()` plain function and have the `@tool` wrapper delegate to it; the fallback imports and calls the raw function directly. See `_build_example_context_raw` and `_query_code_symbols_raw` in `agents/tools.py`.
 
 
 ## Module Map
@@ -206,7 +233,7 @@ Not every project gets every collection — `RepoAnalyzer` inspects the repo and
 ```
 explorer/
 ├── config.py              # Pydantic settings (ExplorerConfig)
-├── registry.py            # Project Registry (SQLite: projects, project_stats, project_commits)
+├── registry.py            # Project Registry (SQLite: projects, project_stats, project_commits); Project dataclass includes subproject_path, parent_slug, extra_docs_paths
 ├── rag_system.py          # Main orchestrator — entry point for all queries
 ├── query_processor.py     # Intent classifier + agent router
 ├── collection_router.py   # Selects relevant collections per query
@@ -220,8 +247,9 @@ explorer/
 ├── ingestion/
 ├── agents/
 │   ├── base.py            # BaseExplorerAgent (_infer_project_slug, _clarification_response)
-│   ├── tools.py           # BeeAI @tool functions (vector_search, query_project_stats, ...)
+│   ├── tools.py           # BeeAI @tool functions (vector_search, build_example_context, ...); _raw helpers for fallback use
 │   ├── stats_agent.py     # GitHub stats + commit trends (uses stats tools)
+│   ├── examples_agent.py  # Generates complete runnable Python examples (EXAMPLES intent)
 │   └── conversation_agent.py  # Multi-turn BeeAI session wrapper
 ├── cli/
 │   └── main.py            # Typer app (add, list, ask, chat, refresh, web, serve, tui, ...)

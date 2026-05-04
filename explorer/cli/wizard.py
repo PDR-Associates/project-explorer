@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path, PurePath
 
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
@@ -27,16 +28,25 @@ class OnboardingWizard:
         self.registry = ProjectRegistry()
         self.analyzer = RepoAnalyzer()
 
-    def run(self, github_url: str, accept_all: bool = False) -> None:
-        self.console.print(f"\n[bold]Analyzing[/bold] {github_url} ...")
+    def run(
+        self,
+        github_url: str,
+        accept_all: bool = False,
+        subproject_path: str | None = None,
+        slug_override: str | None = None,
+        extra_docs_paths: list[str] | None = None,
+        local_path: str | None = None,
+    ) -> None:
+        label = f"{github_url}" + (f" [{subproject_path}]" if subproject_path else "")
+        self.console.print(f"\n[bold]Analyzing[/bold] {label} ...")
 
         try:
-            plan = self.analyzer.analyze(github_url)
+            plan = self.analyzer.analyze(github_url, subpath=subproject_path)
+            plan = self._augment_plan_for_extra_paths(plan, extra_docs_paths or [], local_path)
         except ValueError as exc:
             self.console.print(f"[red]Error:[/red] {exc}")
             return
         except Exception as exc:
-            # Strip the raw traceback for common API errors (404, rate limit, auth)
             msg = str(exc)
             if "404" in msg or "Not Found" in msg:
                 self.console.print(
@@ -55,12 +65,39 @@ class OnboardingWizard:
                 self.console.print(f"[red]Failed to analyze repository:[/red] {exc}")
             return
 
-        slug = self._url_to_slug(github_url)
+        slug = slug_override or self._url_to_slug(github_url)
+        if subproject_path and not slug_override:
+            # Derive slug from subpath when no override given: repo_subpath
+            subpath_slug = re.sub(r"[^a-z0-9_]", "_", subproject_path.strip("/").replace("/", "_").lower())
+            slug = f"{slug}_{subpath_slug}"
+
+        # Find parent slug (project with same URL, no subproject_path)
+        parent_slug = ""
+        if subproject_path:
+            parent = self.registry.get_by_github_url(github_url)
+            if parent and not parent.subproject_path:
+                parent_slug = parent.slug
 
         if self.registry.exists(slug):
             self.console.print(f"[yellow]Project '{slug}' is already registered.[/yellow]")
             if accept_all or Confirm.ask("Re-index it?"):
-                self._trigger_ingestion(slug, plan)
+                project = self.registry.get(slug)
+                # Use newly provided extra_docs_paths if given, otherwise keep stored ones
+                effective_extra = extra_docs_paths if extra_docs_paths is not None else (project.extra_docs_paths or [])
+                if extra_docs_paths is not None and extra_docs_paths != project.extra_docs_paths:
+                    self.registry.update_extra_docs_paths(slug, extra_docs_paths)
+                plan = self._augment_plan_for_extra_paths(plan, effective_extra, local_path)
+                # Drop existing collections so re-ingestion starts clean (no duplicate vectors)
+                from explorer.multi_collection_store import MultiCollectionStore
+                store = MultiCollectionStore()
+                for c in project.collections:
+                    store.drop_collection(c)
+                self._trigger_ingestion(
+                    slug, plan,
+                    subproject_path=project.subproject_path or None,
+                    extra_docs_paths=effective_extra or None,
+                    local_path=local_path,
+                )
             return
 
         self._show_plan(plan)
@@ -78,18 +115,26 @@ class OnboardingWizard:
             "Documentation site URL (optional, press Enter to skip)", default=""
         )
 
+        display_name = plan.display_name
+        if subproject_path:
+            display_name = f"{plan.display_name} / {subproject_path}"
+
         project = Project(
             slug=slug,
-            display_name=plan.display_name,
+            display_name=display_name,
             github_url=github_url,
             description=plan.description,
             homepage_url=plan.homepage_url,
             docs_url=docs_url,
             collections=[f"{slug}_{ct.name}" for ct in confirmed_types],
+            subproject_path=subproject_path or "",
+            parent_slug=parent_slug,
+            extra_docs_paths=extra_docs_paths or [],
         )
         self.registry.add(project)
-        self.console.print(f"\n[green]Registered '{plan.display_name}' as '{slug}'.[/green]")
-        self._trigger_ingestion(slug, plan, confirmed_types)
+        self.console.print(f"\n[green]Registered '{display_name}' as '{slug}'.[/green]")
+        self._trigger_ingestion(slug, plan, confirmed_types, subproject_path=subproject_path,
+                                extra_docs_paths=extra_docs_paths, local_path=local_path)
 
     def _show_plan(self, plan) -> None:
         table = Table(title=f"Proposed collections for {plan.display_name}")
@@ -108,11 +153,26 @@ class OnboardingWizard:
                 selected.append(ct)
         return selected
 
-    def _trigger_ingestion(self, slug: str, plan, collection_types=None) -> None:
+    def _trigger_ingestion(
+        self,
+        slug: str,
+        plan,
+        collection_types=None,
+        subproject_path: str | None = None,
+        extra_docs_paths: list[str] | None = None,
+        local_path: str | None = None,
+    ) -> None:
         from explorer.ingestion.pipeline import IngestionPipeline
         self.console.print("\n[bold]Starting ingestion...[/bold]")
         pipeline = IngestionPipeline()
-        pipeline.run(slug, plan.github_url, collection_types or plan.proposed_collections)
+        pipeline.run(
+            slug,
+            plan.github_url,
+            collection_types or plan.proposed_collections,
+            subproject_path=subproject_path,
+            extra_docs_paths=extra_docs_paths,
+            local_path=local_path,
+        )
         self._post_ingestion(slug, plan.github_url)
 
     def _post_ingestion(self, slug: str, github_url: str) -> None:
@@ -142,6 +202,72 @@ class OnboardingWizard:
                 self.console.print(f"[dim]Stats fetched ({n} commits stored).[/dim]")
         except Exception as exc:
             self.console.print(f"[dim]Stats fetch skipped: {exc}[/dim]")
+
+    def _augment_plan_for_extra_paths(self, plan, extra_docs_paths: list[str], local_path: str | None):
+        """
+        Add collection types implied by extra_docs_paths that the analyzer missed.
+
+        The analyzer only scans the --subpath directory.  Extra paths (outside the
+        subpath) may contain examples, markdown, or PDFs whose collection types were
+        never proposed.  This method scans those paths — from disk when --from-local
+        is available, otherwise by heuristic on path names — and appends any missing
+        collection types to plan.proposed_collections.
+        """
+        from config.collection_config import COLLECTION_TYPES
+
+        if not extra_docs_paths:
+            return plan
+
+        proposed_names = {ct.name for ct in plan.proposed_collections}
+        candidates = ("examples", "markdown_docs", "pdfs", "api_reference")
+        to_add = []
+
+        if local_path:
+            root = Path(local_path).expanduser().resolve()
+            found_exts: set[str] = set()
+            for rel in extra_docs_paths:
+                p = root / rel
+                if p.is_file():
+                    found_exts.add(p.suffix.lower())
+                elif p.is_dir():
+                    for f in p.rglob("*"):
+                        if f.is_file():
+                            found_exts.add(f.suffix.lower())
+            for name in candidates:
+                if name not in proposed_names:
+                    ctype = COLLECTION_TYPES.get(name)
+                    if ctype and any(ext in found_exts for ext in ctype.file_extensions):
+                        to_add.append(ctype)
+        else:
+            # Heuristic when no local clone is available
+            for rel in extra_docs_paths:
+                parts = PurePath(rel).parts
+                first = parts[0].lower() if parts else ""
+                suffix = PurePath(rel).suffix.lower()
+                if first in RepoAnalyzer.EXAMPLE_DIRS and "examples" not in proposed_names:
+                    ctype = COLLECTION_TYPES.get("examples")
+                    if ctype:
+                        to_add.append(ctype)
+                        proposed_names.add("examples")
+                if suffix == ".md" and "markdown_docs" not in proposed_names:
+                    ctype = COLLECTION_TYPES.get("markdown_docs")
+                    if ctype:
+                        to_add.append(ctype)
+                        proposed_names.add("markdown_docs")
+                if suffix == ".pdf" and "pdfs" not in proposed_names:
+                    ctype = COLLECTION_TYPES.get("pdfs")
+                    if ctype:
+                        to_add.append(ctype)
+                        proposed_names.add("pdfs")
+
+        if to_add:
+            plan.proposed_collections = plan.proposed_collections + to_add
+            for ct in to_add:
+                plan.file_counts[ct.name] = "extra"
+            names = ", ".join(ct.name for ct in to_add)
+            self.console.print(f"[dim]Added from extra-docs-paths: {names}[/dim]")
+
+        return plan
 
     @staticmethod
     def _url_to_slug(url: str) -> str:

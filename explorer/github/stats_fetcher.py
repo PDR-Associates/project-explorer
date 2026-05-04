@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from explorer.github.client import GitHubClient
 from explorer.registry import ProjectRegistry
 
-_COMMIT_LOOKBACK_DAYS = 90
+_COMMIT_LOOKBACK_DAYS_DEFAULT = 90
 
 
 def _percentile(values: list[int], p: int) -> float:
@@ -49,7 +49,7 @@ class StatsFetcher:
         self.client = GitHubClient()
         self.registry = ProjectRegistry()
 
-    def fetch(self, project_slug: str) -> dict:
+    def fetch(self, project_slug: str, lookback_days: int = _COMMIT_LOOKBACK_DAYS_DEFAULT) -> dict:
         import sqlite3
 
         project = self.registry.get(project_slug)
@@ -73,6 +73,7 @@ class StatsFetcher:
             "contributors_count": repo.get_contributors().totalCount,
             "commits_30d": self._count_commits(repo, days=30),
             "commits_90d": self._count_commits(repo, days=90),
+            "commits_365d": self._count_commits(repo, days=365) if lookback_days >= 365 else None,
             "releases_count": len(releases),
             "latest_release": self._latest_release_tag(releases),
             "latest_release_at": self._latest_release_date(releases),
@@ -92,12 +93,12 @@ class StatsFetcher:
         conn.execute("""
             INSERT INTO project_stats
             (project_slug, fetched_at, stars, forks, watchers, open_issues,
-             contributors_count, commits_30d, commits_90d, releases_count,
+             contributors_count, commits_30d, commits_90d, commits_365d, releases_count,
              latest_release, latest_release_at, avg_release_interval_days,
              primary_language, language_breakdown, lines_of_code, file_count,
              repo_size_kb, license, topics, repo_created_at, last_pushed_at)
             VALUES (:project_slug, :fetched_at, :stars, :forks, :watchers, :open_issues,
-                    :contributors_count, :commits_30d, :commits_90d, :releases_count,
+                    :contributors_count, :commits_30d, :commits_90d, :commits_365d, :releases_count,
                     :latest_release, :latest_release_at, :avg_release_interval_days,
                     :primary_language, :language_breakdown, :lines_of_code, :file_count,
                     :repo_size_kb, :license, :topics, :repo_created_at, :last_pushed_at)
@@ -105,19 +106,19 @@ class StatsFetcher:
         conn.commit()
         conn.close()
         try:
-            count = self._fetch_commits(slug, repo)
+            count = self._fetch_commits(slug, repo, lookback_days=lookback_days)
             stats["commits_fetched"] = count
         except Exception as exc:
             stats["commits_fetch_error"] = str(exc)
         return stats
 
-    def _fetch_commits(self, project_slug: str, repo) -> int:
+    def _fetch_commits(self, project_slug: str, repo, lookback_days: int = _COMMIT_LOOKBACK_DAYS_DEFAULT) -> int:
         """
         Fetch recent commits, store per-commit additions/deletions, and compute contributor stats.
         Returns row count processed. additions/deletions require one extra API call per new commit;
-        stops fetching them gracefully if the rate limit is hit.
+        stops fetching them gracefully if the rate limit is hit or quota is low.
         """
-        since = datetime.utcnow() - timedelta(days=_COMMIT_LOOKBACK_DAYS)
+        since = datetime.utcnow() - timedelta(days=lookback_days)
         commits = repo.get_commits(since=since)  # raises on API failure — caller handles
 
         # SHAs already stored with non-null additions — skip extra API call for these
@@ -130,8 +131,18 @@ class StatsFetcher:
         }
         conn.close()
 
+        # Pre-check quota: skip diff stats entirely if fewer than 100 calls remain.
+        # Each new commit needs one extra REST call; for long histories this depletes the limit fast.
+        fetch_diff_stats = True
+        try:
+            rl = self.client.check_rate_limit()
+            if rl["remaining"] < 100:
+                fetch_diff_stats = False
+        except Exception:
+            pass  # optimistic if rate-limit check itself fails
+
         rows = []
-        fetch_diff_stats = True  # flipped to False on rate limit
+        diff_calls = 0
         for c in commits:
             commit = c.commit
             author = commit.author
@@ -150,8 +161,16 @@ class StatsFetcher:
                 try:
                     additions = c.stats.additions
                     deletions = c.stats.deletions
+                    diff_calls += 1
+                    # Re-check quota every 50 diff-stat calls to avoid hitting the wall
+                    if diff_calls % 50 == 0:
+                        try:
+                            rl = self.client.check_rate_limit()
+                            if rl["remaining"] < 100:
+                                fetch_diff_stats = False
+                        except Exception:
+                            pass
                 except Exception as exc:
-                    # Stop fetching diff stats if rate-limited; other errors are per-commit noise
                     if "rate limit" in str(exc).lower():
                         fetch_diff_stats = False
 
@@ -184,17 +203,18 @@ class StatsFetcher:
         conn.commit()
         conn.close()
 
-        self._compute_contributor_stats(project_slug)
+        self._compute_contributor_stats(project_slug, lookback_days=lookback_days)
         return len(rows)
 
-    def _compute_contributor_stats(self, project_slug: str) -> None:
+    def _compute_contributor_stats(self, project_slug: str, lookback_days: int = _COMMIT_LOOKBACK_DAYS_DEFAULT) -> None:
         """
-        Aggregate per-author commits/additions/deletions for 30d and 90d windows
-        and classify each contributor into a tier (core / regular / occasional).
+        Aggregate per-author commits/additions/deletions for 30d, 90d (and 365d when data covers it)
+        windows and classify each contributor into a tier (core / regular / occasional).
         Tiers are relative to the project's own distribution, not a global threshold.
         """
         now = datetime.utcnow()
-        for days in (30, 90):
+        windows = (30, 90, 365) if lookback_days >= 365 else (30, 90)
+        for days in windows:
             cutoff = (now - timedelta(days=days)).isoformat()
             period_start = (now - timedelta(days=days)).date().isoformat()
             period_end = now.date().isoformat()
@@ -279,11 +299,38 @@ class StatsFetcher:
         return total
 
     def _count_files(self, repo) -> int:
+        import logging
+        log = logging.getLogger(__name__)
         try:
             tree = repo.get_git_tree(repo.default_branch, recursive=True)
-            return sum(1 for e in tree.tree if e.type == "blob")
-        except Exception:
+            if not tree.truncated:
+                return sum(1 for e in tree.tree if e.type == "blob")
+            # GitHub truncates recursive trees for large repos (>100k nodes).
+            # The truncated response is cut off mid-traversal so its entry list is incomplete.
+            # Fetch the root non-recursively instead — that is never truncated because the
+            # root has far fewer than 100k direct children — then walk each subtree.
+            log.debug("Git tree truncated for %s, walking subdirectories", repo.full_name)
+            root = repo.get_git_tree(repo.default_branch, recursive=False)
+            return self._count_files_walk(repo, root)
+        except Exception as exc:
+            log.warning("Failed to count files for %s: %s", repo.full_name, exc)
             return 0
+
+    def _count_files_walk(self, repo, tree) -> int:
+        """Recursively count blobs by fetching each subtree entry individually."""
+        count = sum(1 for e in tree.tree if e.type == "blob")
+        for entry in tree.tree:
+            if entry.type != "tree":
+                continue
+            try:
+                subtree = repo.get_git_tree(entry.sha, recursive=True)
+                if not subtree.truncated:
+                    count += sum(1 for e in subtree.tree if e.type == "blob")
+                else:
+                    count += self._count_files_walk(repo, subtree)
+            except Exception:
+                pass
+        return count
 
     def _license_name(self, repo) -> str:
         try:

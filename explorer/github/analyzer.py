@@ -25,9 +25,12 @@ class RepoAnalyzer:
     def __init__(self) -> None:
         self._client = GitHubClient()
 
-    def analyze(self, github_url: str) -> "IngestionPlan":
+    def analyze(self, github_url: str, subpath: str | None = None) -> "IngestionPlan":
         repo = self._client.get_repo(github_url)
         files = self._client.list_files(repo, recursive=True)
+        if subpath:
+            prefix = subpath.strip("/") + "/"
+            files = [f for f in files if f.startswith(prefix)]
         return self._build_plan(repo, files)
 
     def _build_plan(self, repo: Repository, files: list[str]) -> "IngestionPlan":
