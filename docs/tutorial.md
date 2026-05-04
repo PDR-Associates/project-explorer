@@ -1456,7 +1456,18 @@ project-explorer chat --project egeria_python
 
 ### The Fallback Path
 
-When BeeAI fails (LLM timeout, tool error, max iterations reached), `ExamplesAgent._fallback()` bypasses the agent loop and calls the underlying retrieval logic directly, then constructs a single LLM prompt from the aggregated context.
+When BeeAI fails (LLM timeout, tool error, max iterations reached), or when the agent loop completes but the LLM produces a text description instead of a runnable code block, `ExamplesAgent._fallback()` bypasses the agent loop and calls the underlying retrieval logic directly.
+
+The gate that decides whether to use the BeeAI result or fall back is:
+
+```python
+response = self._run_agent(prompt)
+if "```python" in response:   # only accept a real fenced code block
+    return response
+return self._fallback(query, slug)
+```
+
+Checking for ` ```python ` specifically (not just ` ``` `) prevents accepting responses where the LLM listed method names with inline backticks instead of writing code.
 
 **BeeAI `FunctionTool` objects have no `.func` attribute** — you cannot call `my_tool.func(...)` to invoke the wrapped function. The correct pattern is to extract the implementation into a private `_raw` helper and have the `@tool` wrapper delegate to it:
 
@@ -1469,7 +1480,57 @@ def build_example_context(project_slug: str, topic: str) -> str:
     return _build_example_context_raw(project_slug, topic)
 ```
 
-The fallback then imports and calls `_build_example_context_raw` and `_query_code_symbols_raw` directly — plain Python, no BeeAI involved. This gives a best-effort response rather than an error, at the cost of fewer tool iterations.
+The fallback imports and calls `_build_example_context_raw` and `_query_code_symbols_raw` directly — plain Python, no BeeAI involved.
+
+### Context Hints
+
+Small models (llama3.1:8b) frequently ignore the exact class names and constructor signatures in retrieved chunks, instead falling back to training-data guesses. Two hints are injected at the top of every context block to counteract this:
+
+**Import hint** — `_build_example_context_raw` scans all retrieved text for capitalised identifiers used as constructors and emits a concrete import line:
+
+```
+IMPORT HINT: These classes come from the 'pyegeria' package.
+  from pyegeria import GlossaryManager, GlossaryTermProperties, NewElementRequestBody
+```
+
+**Constructor hint** — the same function extracts the first concrete multi-argument instantiation for each class and presents the exact signature:
+
+```
+CONSTRUCTOR PATTERNS (use these exact signatures):
+  GlossaryManager( self.view_server, self.platform_url, user_id=self.user, user_pwd=self.password, )
+```
+
+Both hints appear before the retrieved chunks so they are at the top of the LLM's context window. Without them, the LLM invents argument names (`server_url=`, `username=`) that don't match the real API.
+
+### Indexing Test Files for Better Examples
+
+The quality of generated examples depends on what's in the `examples` collection. Source code alone is not enough — it shows *what* the API does but not *how* to use it end-to-end. The functional and scenario tests in a project's test suite are often the best source of correct usage patterns: they show constructor arguments, authentication calls, cleanup, and realistic values.
+
+For pyegeria, `tests/functional-tests/` and `tests/scenario-tests/` are indexed as extra docs paths alongside `examples/`:
+
+```bash
+project-explorer add https://github.com/odpi/egeria-python \
+  --subpath pyegeria --name pyegeria \
+  --extra-docs-path docs/user_programming.md \
+  --extra-docs-path examples/ \
+  --extra-docs-path tests/functional-tests/ \
+  --extra-docs-path tests/scenario-tests/ \
+  --from-local /path/to/egeria-python --yes
+```
+
+### Intent Routing for Example Queries
+
+`routing.yaml` controls which queries reach `ExamplesAgent`. The `examples` intent must match before `code_search`, which also has patterns that would otherwise absorb "show me an example of X" and "how do I use X".
+
+Patterns that now route to `ExamplesAgent`:
+
+| Query form | Pattern |
+|---|---|
+| `write me a python example for X` | `write (me )?(a \|an )?(python )?example` |
+| `example of X` / `example for X` | `(example\|sample\|demo) (of\|for) \w` |
+| `show me an example of X` | `(show\|give) (me )?(an? )?(example\|sample\|demo) (of\|for) \w` |
+| `how do I use X` / `how do I call X` | `how (do i\|to\|can i).{0,50}(use\|call\|invoke\|work with)` |
+| `X example` (trailing) | `\w.{3,60} (example\|usage example\|demo)(\?)?$` |
 
 The pattern — try the agent, fall back to a direct retrieval+LLM call using `_raw` helpers — applies to any agent where a partial answer is more useful than an exception.
 

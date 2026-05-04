@@ -473,11 +473,13 @@ def _build_example_context_raw(project_slug: str, topic: str) -> str:
             "The project may need re-indexing, or try a broader topic."
         )
 
-    # Extract class names that appear as constructors or type annotations in the
-    # retrieved chunks and prepend a concrete import hint.  This compensates for
-    # the import chunk rarely scoring high enough to be retrieved on its own.
+    # Build hints from the retrieved text so the LLM doesn't have to infer
+    # imports or constructor signatures — both are frequently in a different
+    # chunk than the usage code and score too low to be retrieved on their own.
     import re as _re
     combined = "\n".join(sections)
+
+    # Import hint: collect capitalised names used as constructors
     class_names = _re.findall(r'\b([A-Z][A-Za-z0-9]+)\s*\(', combined)
     known_classes = sorted({
         n for n in class_names
@@ -490,7 +492,31 @@ def _build_example_context_raw(project_slug: str, topic: str) -> str:
             f"  from {slug} import {', '.join(known_classes[:6])}\n\n"
         )
 
-    header = f"Context for: '{topic}' in {slug}\n{'=' * 60}\n\n{import_hint}"
+    # Constructor hint: extract the first concrete multi-arg instantiation for
+    # each class so the LLM sees real parameter names, not self.xxx placeholders.
+    constructor_hints: list[str] = []
+    for cls in known_classes[:6]:
+        # Match ClassName(\n    arg, kw=val, ...\n) — allow multi-line
+        pattern = cls + r'\s*\(\s*\n?((?:[^\(\)]*\n?){1,8})\)'
+        for m in _re.finditer(pattern, combined):
+            args = m.group(1).strip()
+            # Skip trivial no-arg or single self calls
+            if args and 'self.' not in args and len(args) > 4:
+                one_line = ' '.join(args.split())
+                constructor_hints.append(f"  {cls}({one_line})")
+                break
+
+    constructor_hint = ""
+    if constructor_hints:
+        constructor_hint = (
+            "CONSTRUCTOR PATTERNS (use these exact signatures):\n"
+            + "\n".join(constructor_hints) + "\n\n"
+        )
+
+    header = (
+        f"Context for: '{topic}' in {slug}\n{'=' * 60}\n\n"
+        f"{import_hint}{constructor_hint}"
+    )
     return header + "\n\n---\n\n".join(sections)
 
 

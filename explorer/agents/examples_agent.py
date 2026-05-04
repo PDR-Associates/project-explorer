@@ -53,9 +53,9 @@ class ExamplesAgent(BaseExplorerAgent):
         prompt = f"Project: {slug}\n\nRequest: {query}"
         try:
             response = self._run_agent(prompt)
-            # If BeeAI returned a response without a code block, the LLM skipped
-            # tool calls and hallucinated — use the direct retrieval fallback instead
-            if "```" in response:
+            # Only accept a BeeAI response that contains an actual fenced code
+            # block — inline backticks or a plain-text method list don't count
+            if "```python" in response:
                 return response
             return self._fallback(query, slug)
         except Exception:
@@ -85,16 +85,18 @@ class ExamplesAgent(BaseExplorerAgent):
                 "runnable Python code example based ONLY on the retrieved context below. "
                 "IMPORTANT: Use ONLY the class names, imports, and method signatures that "
                 "appear verbatim in the context — do NOT invent class names or module paths. "
-                "Return the example inside a fenced ```python block, "
-                "then add a 2-4 sentence explanation of what the code does."
+                "Your response MUST contain a fenced ```python code block with complete, "
+                "runnable code. Do NOT respond with only a text description."
             )
             user_prompt = (
-                f"Write a Python example for: {query}\n"
+                f"Write a complete Python code example for: {query}\n"
                 f"Project: {slug}\n\n"
                 f"Retrieved context (use ONLY these imports, class names, method signatures):\n"
                 f"{context}\n\n"
                 f"Relevant classes:\n{symbols_raw}\n\n"
-                f"Now write the complete Python example using ONLY names from the context above:"
+                f"Respond with a ```python code block containing ALL necessary imports, "
+                f"client setup (including constructor arguments visible in the context), "
+                f"the requested operations, and error handling. Then add a brief explanation."
             )
             return get_llm().complete(user_prompt, system=system)
         except Exception as exc:

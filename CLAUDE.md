@@ -151,7 +151,7 @@ Tools in `agents/tools.py`:
 - `query_commit_activity(project_slug)` — used by Stats agent
 - `query_code_symbols(project_slug, kind, pattern)` — used by CodeInventory, Examples agents
 - `get_symbol_detail(project_slug, name)` — used by CodeInventory, Examples agents
-- `build_example_context(project_slug, topic)` — used by ExamplesAgent; searches examples, python_code, api_reference, and markdown_docs collections in one call and returns formatted context for code generation
+- `build_example_context(project_slug, topic)` — used by ExamplesAgent; searches examples, python_code, api_reference, and markdown_docs collections in one call and returns formatted context for code generation; prepends IMPORT HINT and CONSTRUCTOR PATTERNS extracted from the retrieved chunks so small models don't invent argument names
 - `query_dependencies(project_slug, dep_type)` — used by Dependency agent
 
 `BaseExplorerAgent` also provides:
@@ -226,6 +226,8 @@ Not every project gets every collection — `RepoAnalyzer` inspects the repo and
 12. `--extra-docs-path` only has effect when `--subpath` is also set — without a subpath the full repo is already downloaded, so all paths are already covered; when both are set, the pipeline downloads the full repo and uses `code_root = full_root / subpath` for code collections while also walking the extra paths for doc/example collections
 13. `--from-local` skips the GitHub zipball download for the initial `add`; the GitHub URL is still stored in the registry and used for stats, incremental refresh, and webhook events — `--from-local` has no effect on `refresh`, which always re-downloads from GitHub
 14. BeeAI `FunctionTool` objects (produced by `@tool`) have no `.func` attribute — calling `my_tool.func(...)` raises `AttributeError`. To call tool logic outside the agent loop (e.g., in a `_fallback()` method), extract the implementation into a `_<name>_raw()` plain function and have the `@tool` wrapper delegate to it; the fallback imports and calls the raw function directly. See `_build_example_context_raw` and `_query_code_symbols_raw` in `agents/tools.py`.
+15. `ExamplesAgent._fallback()` is the reliable path for example generation with small models — BeeAI + llama3.1:8b frequently completes without calling any tools and returns a plain-text method list. Gate on `"```python" in response` (not just `"```"`) so inline-backtick responses still fall through to the fallback. Index the project's functional/scenario tests as extra-docs-paths to give the fallback retrieval concrete, correct constructor signatures to work from.
+16. `routing.yaml` `examples` patterns must appear before `code_search` patterns that would otherwise absorb "show me an example of X" and "how do I use X". Use single-quoted strings for all patterns containing `\w` or other regex metacharacters.
 
 
 ## Module Map
