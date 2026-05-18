@@ -166,20 +166,41 @@ class FileClassifierSurveyor(BaseSurveyor):
         return results
 
     def _collect_file_paths(self) -> list[str]:
-        """Return all indexed file paths: code symbols (SQLite) + all Milvus collections."""
+        """Return all file paths for this project.
+
+        Primary source: project_file_inventory (populated during add/refresh — covers
+        every file in the repo).  Falls back to three partial sources for projects
+        that pre-date the inventory table:
+          • project_code_symbols  — Python/JS/Java/Go source files
+          • Milvus metadata       — markdown, examples, release notes, web docs, PDFs
+          • project_dependencies.source_file — package manifests
+        """
         slug = self.project.slug
 
-        # Code files — fast SQLite lookup
+        # Primary: full file inventory (populated by ingestion pipeline)
+        inventory = self.registry.get_file_inventory(slug)
+        if inventory:
+            log.debug("_collect_file_paths: %s → %d files from inventory", slug, len(inventory))
+            return inventory
+
+        # Fallback for projects indexed before the inventory table existed
+        log.debug("_collect_file_paths: %s — no inventory; using partial sources", slug)
         with self.registry._conn() as conn:
-            rows = conn.execute(
+            code_rows = conn.execute(
                 "SELECT DISTINCT file_path FROM project_code_symbols WHERE project_slug = ?",
                 (slug,),
             ).fetchall()
-        paths: set[str] = {r["file_path"] for r in rows}
+            dep_rows = conn.execute(
+                "SELECT DISTINCT source_file FROM project_dependencies "
+                "WHERE project_slug = ? AND source_file != ''",
+                (slug,),
+            ).fetchall()
 
+        paths: set[str] = {r["file_path"] for r in code_rows}
         code_count = len(paths)
+        dep_paths = {r["source_file"] for r in dep_rows}
+        paths.update(dep_paths)
 
-        # Doc / example / API files — stored in Milvus metadata, not in SQLite
         project = self.registry.get(slug)
         if project and project.collections:
             from explorer.multi_collection_store import MultiCollectionStore
@@ -188,7 +209,8 @@ class FileClassifierSurveyor(BaseSurveyor):
             paths.update(p for p in milvus_paths if p and not p.startswith("http"))
 
         log.debug(
-            "_collect_file_paths: %s → %d code + %d milvus = %d total",
-            slug, code_count, len(paths) - code_count, len(paths),
+            "_collect_file_paths: %s → %d code + %d dep + %d milvus = %d total (partial)",
+            slug, code_count, len(dep_paths),
+            len(paths) - code_count - len(dep_paths), len(paths),
         )
         return list(paths)

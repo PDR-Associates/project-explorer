@@ -266,6 +266,21 @@ class ProjectRegistry:
                 conn.execute(
                     "ALTER TABLE project_file_type_counts ADD COLUMN details_json TEXT DEFAULT NULL"
                 )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS project_file_inventory (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_slug     TEXT NOT NULL,
+                    file_path        TEXT NOT NULL,
+                    file_size_bytes  INTEGER DEFAULT 0,
+                    indexed_at       TEXT NOT NULL,
+                    UNIQUE(project_slug, file_path),
+                    FOREIGN KEY (project_slug) REFERENCES projects(slug)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_file_inventory_slug "
+                "ON project_file_inventory(project_slug)"
+            )
 
     def add(self, project: Project) -> None:
         data = {
@@ -552,6 +567,34 @@ class ProjectRegistry:
                 (slug,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── full file inventory ───────────────────────────────────────────────────
+
+    def upsert_file_inventory(
+        self, slug: str, paths_with_sizes: list[tuple[str, int]]
+    ) -> None:
+        """Replace the file inventory for a project (called during add/refresh)."""
+        slug = self._normalize_slug(slug)
+        indexed_at = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM project_file_inventory WHERE project_slug = ?", (slug,)
+            )
+            conn.executemany(
+                "INSERT INTO project_file_inventory "
+                "(project_slug, file_path, file_size_bytes, indexed_at) VALUES (?, ?, ?, ?)",
+                [(slug, path, size, indexed_at) for path, size in paths_with_sizes],
+            )
+
+    def get_file_inventory(self, slug: str) -> list[str]:
+        """Return all file paths from the stored inventory for a project."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT file_path FROM project_file_inventory WHERE project_slug = ?",
+                (slug,),
+            ).fetchall()
+        return [r["file_path"] for r in rows]
 
     # ── dependency graph ──────────────────────────────────────────────────────
 

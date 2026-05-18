@@ -18,6 +18,95 @@ log = logging.getLogger(__name__)
 _DEFAULT_CACHE_PATH = Path("data/file_type_cache.json")
 _REFRESH_AFTER_HOURS = 24
 
+# Built-in defaults — used when the Egeria cache is empty or a key is missing.
+# Egeria ValidMetadataValues take priority when available.
+_BUILTIN_BY_EXTENSION: dict[str, dict] = {
+    # Python
+    "py":    {"deployedImplementationType": "Python Source File"},
+    "pyi":   {"deployedImplementationType": "Python Source File"},
+    "ipynb": {"deployedImplementationType": "Jupyter Notebook"},
+    # Web / JS
+    "js":    {"deployedImplementationType": "JavaScript Source"},
+    "mjs":   {"deployedImplementationType": "JavaScript Source"},
+    "cjs":   {"deployedImplementationType": "JavaScript Source"},
+    "ts":    {"deployedImplementationType": "TypeScript Source"},
+    "tsx":   {"deployedImplementationType": "TypeScript Source"},
+    "jsx":   {"deployedImplementationType": "JavaScript Source"},
+    "html":  {"deployedImplementationType": "HTML File"},
+    "htm":   {"deployedImplementationType": "HTML File"},
+    "css":   {"deployedImplementationType": "CSS Stylesheet"},
+    # JVM
+    "java":  {"deployedImplementationType": "Java Source"},
+    "kt":    {"deployedImplementationType": "Kotlin Source"},
+    "scala": {"deployedImplementationType": "Scala Source"},
+    # Go / Rust / C
+    "go":    {"deployedImplementationType": "Go Source"},
+    "rs":    {"deployedImplementationType": "Rust Source"},
+    "c":     {"deployedImplementationType": "C Source"},
+    "h":     {"deployedImplementationType": "C Header"},
+    "cpp":   {"deployedImplementationType": "C++ Source"},
+    "cc":    {"deployedImplementationType": "C++ Source"},
+    "hpp":   {"deployedImplementationType": "C++ Header"},
+    # Docs
+    "md":    {"deployedImplementationType": "Markdown Document"},
+    "mdx":   {"deployedImplementationType": "Markdown Document"},
+    "rst":   {"deployedImplementationType": "reStructuredText Document"},
+    "txt":   {"deployedImplementationType": "Text File"},
+    "pdf":   {"deployedImplementationType": "PDF Document"},
+    # Config / data
+    "toml":  {"deployedImplementationType": "TOML Configuration"},
+    "yaml":  {"deployedImplementationType": "YAML Configuration"},
+    "yml":   {"deployedImplementationType": "YAML Configuration"},
+    "json":  {"deployedImplementationType": "JSON File"},
+    "xml":   {"deployedImplementationType": "XML File"},
+    "cfg":   {"deployedImplementationType": "Configuration File"},
+    "ini":   {"deployedImplementationType": "Configuration File"},
+    "env":   {"deployedImplementationType": "Environment Configuration"},
+    "lock":  {"deployedImplementationType": "Dependency Lock File"},
+    # Shell / scripts
+    "sh":    {"deployedImplementationType": "Shell Script"},
+    "bash":  {"deployedImplementationType": "Shell Script"},
+    "zsh":   {"deployedImplementationType": "Shell Script"},
+    "bat":   {"deployedImplementationType": "Batch Script"},
+    "ps1":   {"deployedImplementationType": "PowerShell Script"},
+    # SQL
+    "sql":   {"deployedImplementationType": "SQL Script"},
+    # Images
+    "png":   {"deployedImplementationType": "Image File"},
+    "jpg":   {"deployedImplementationType": "Image File"},
+    "jpeg":  {"deployedImplementationType": "Image File"},
+    "gif":   {"deployedImplementationType": "Image File"},
+    "svg":   {"deployedImplementationType": "SVG Image"},
+    "ico":   {"deployedImplementationType": "Image File"},
+}
+
+_BUILTIN_BY_NAME: dict[str, dict] = {
+    "Dockerfile":        {"deployedImplementationType": "Dockerfile"},
+    "Makefile":          {"deployedImplementationType": "Makefile"},
+    "Justfile":          {"deployedImplementationType": "Makefile"},
+    "LICENSE":           {"deployedImplementationType": "License File"},
+    "LICENCE":           {"deployedImplementationType": "License File"},
+    "NOTICE":            {"deployedImplementationType": "License File"},
+    ".gitignore":        {"deployedImplementationType": "Git Configuration"},
+    ".gitattributes":    {"deployedImplementationType": "Git Configuration"},
+    "requirements.txt":  {"deployedImplementationType": "Python Requirements"},
+    "pyproject.toml":    {"deployedImplementationType": "Python Project Config"},
+    "setup.py":          {"deployedImplementationType": "Python Setup Script"},
+    "setup.cfg":         {"deployedImplementationType": "Python Setup Config"},
+    "Pipfile":           {"deployedImplementationType": "Pipenv Config"},
+    "Pipfile.lock":      {"deployedImplementationType": "Dependency Lock File"},
+    "package.json":      {"deployedImplementationType": "Node.js Package Config"},
+    "package-lock.json": {"deployedImplementationType": "Dependency Lock File"},
+    "yarn.lock":         {"deployedImplementationType": "Dependency Lock File"},
+    "go.mod":            {"deployedImplementationType": "Go Module Config"},
+    "go.sum":            {"deployedImplementationType": "Dependency Lock File"},
+    "Cargo.toml":        {"deployedImplementationType": "Rust Package Config"},
+    "Cargo.lock":        {"deployedImplementationType": "Dependency Lock File"},
+    "pom.xml":           {"deployedImplementationType": "Maven Build Config"},
+    "build.gradle":      {"deployedImplementationType": "Gradle Build Config"},
+    "build.gradle.kts":  {"deployedImplementationType": "Gradle Build Config"},
+}
+
 
 class FileTypeCache:
     """
@@ -41,11 +130,20 @@ class FileTypeCache:
     # ── public API ────────────────────────────────────────────────────────────
 
     def lookup(self, file_name: str, extension: str | None) -> dict[str, Any]:
-        """Return metadata dict (may be empty) for the given file."""
+        """Return metadata dict (may be empty) for the given file.
+
+        Priority: Egeria cache by name → Egeria cache by extension →
+                  built-in by name → built-in by extension → empty dict.
+        """
         if file_name in self._by_name:
             return self._by_name[file_name]
         if extension and extension in self._by_ext:
             return self._by_ext[extension]
+        # Fall back to built-in defaults (no Egeria required)
+        if file_name in _BUILTIN_BY_NAME:
+            return _BUILTIN_BY_NAME[file_name]
+        if extension and extension in _BUILTIN_BY_EXTENSION:
+            return _BUILTIN_BY_EXTENSION[extension]
         return {}
 
     def needs_refresh(self) -> bool:

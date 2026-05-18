@@ -180,16 +180,29 @@ class StatsAgent(BaseExplorerAgent):
         return "\n".join(lines)
 
     def _indexed_file_count(self, slug: str, registry) -> str:
-        """Count distinct file paths in project_code_symbols — reliable even when GitHub API returns null."""
+        """Return total file count — prefers survey total, falls back to code-only count."""
         try:
             conn = sqlite3.connect(registry.db_path)
+            # Prefer survey total (all file types across all collections)
+            n = conn.execute(
+                """SELECT SUM(file_count) FROM project_file_type_counts
+                   WHERE project_slug = ?
+                     AND surveyed_at = (
+                         SELECT MAX(surveyed_at) FROM project_file_type_counts WHERE project_slug = ?
+                     )""",
+                (slug, slug),
+            ).fetchone()[0]
+            if n:
+                conn.close()
+                return f"{n} (surveyed)"
+            # Fall back to code-symbols count (Python/JS/Java/Go only)
             n = conn.execute(
                 "SELECT COUNT(DISTINCT file_path) FROM project_code_symbols WHERE project_slug = ?",
                 (slug,),
             ).fetchone()[0]
             conn.close()
             if n:
-                return f"{n} (indexed)"
+                return f"{n} (code files only — run survey for full count)"
         except Exception:
             pass
         d = getattr(self, '_last_stats_row', {})

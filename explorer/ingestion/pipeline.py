@@ -133,6 +133,7 @@ class IngestionPipeline:
                 progress.advance(task)
 
         file_count, loc = self._count_repo_stats(code_root)
+        self._store_file_inventory(project_slug, code_root)
         self._parse_dependencies(project_slug, code_root)
         return file_count, loc
 
@@ -270,6 +271,25 @@ class IngestionPipeline:
                 except Exception:
                     pass
         return file_count, line_count
+
+    def _store_file_inventory(self, project_slug: str, local_root: Path) -> None:
+        """Persist every file path (relative to local_root) and its size to SQLite."""
+        paths_with_sizes: list[tuple[str, int]] = []
+        for p in local_root.rglob("*"):
+            if not p.is_file():
+                continue
+            try:
+                size = p.stat().st_size
+            except Exception:
+                size = 0
+            paths_with_sizes.append((str(p.relative_to(local_root)), size))
+        try:
+            self.registry.upsert_file_inventory(project_slug, paths_with_sizes)
+            self.console.print(
+                f"[dim]File inventory: {len(paths_with_sizes)} paths stored.[/dim]"
+            )
+        except Exception as exc:
+            self.console.print(f"[dim]File inventory skipped: {exc}[/dim]")
 
     def _local_files(self, local_root: Path, extensions: list[str]) -> list[tuple[str, str]]:
         """Walk the extracted repo and return (relative_path, content) for matching files."""

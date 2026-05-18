@@ -83,20 +83,34 @@ def query_project_stats(project_slug: str, days: int = 90) -> str:
     kb = d.get("repo_size_kb")
     size_str = f"{int(kb) / 1024:.1f} MB" if kb and int(kb) >= 1024 else (f"{kb} KB" if kb else "N/A")
 
-    # Count indexed files from code symbols — reliable even when GitHub API returns null
+    # Prefer survey total (all file types) over code-only SQLite count
     try:
         _cs_conn = sqlite3.connect(registry.db_path)
-        indexed_files = _cs_conn.execute(
-            "SELECT COUNT(DISTINCT file_path) FROM project_code_symbols WHERE project_slug = ?",
-            (slug,),
+        survey_total = _cs_conn.execute(
+            """SELECT SUM(file_count) FROM project_file_type_counts
+               WHERE project_slug = ?
+                 AND surveyed_at = (
+                     SELECT MAX(surveyed_at) FROM project_file_type_counts WHERE project_slug = ?
+                 )""",
+            (slug, slug),
         ).fetchone()[0]
+        if not survey_total:
+            # Fall back to code-symbols count (Python/JS/Java/Go only)
+            survey_total = _cs_conn.execute(
+                "SELECT COUNT(DISTINCT file_path) FROM project_code_symbols WHERE project_slug = ?",
+                (slug,),
+            ).fetchone()[0]
+            file_count_note = "code files only — run survey for full count"
+        else:
+            file_count_note = "surveyed"
         _cs_conn.close()
     except Exception:
-        indexed_files = None
+        survey_total = None
+        file_count_note = ""
 
     file_count_str = (
-        f"{indexed_files} (indexed)"
-        if indexed_files
+        f"{survey_total} ({file_count_note})"
+        if survey_total
         else (v('ingestion_file_count') if d.get('ingestion_file_count') is not None else v('file_count'))
     )
 
