@@ -14,6 +14,7 @@ project-explorer ask --project arrow "How does the Flight RPC protocol work?"
 project-explorer ask --project arrow "Who are the most active contributors in the last 90 days?"
 project-explorer chat --project arrow
 project-explorer web   # browser UI with Plotly charts and markdown rendering
+project-explorer survey --project arrow   # Egeria-aligned analysis: file types, health, security, deps
 ```
 
 It classifies your question, routes it to the right agent (code search, documentation, statistics, health), retrieves relevant context from Milvus, and synthesizes an answer with an LLM.
@@ -253,6 +254,11 @@ project-explorer serve --all
 
 # Remove a project and all its data
 project-explorer remove myproject
+
+# Survey a project — Egeria-aligned annotation report (no Egeria required by default)
+project-explorer survey myproject
+project-explorer survey myproject --publish     # push SurveyReport + Annotations to Egeria
+project-explorer survey myproject --refresh     # force-refresh FileTypeCache from Egeria first
 ```
 
 ---
@@ -265,7 +271,7 @@ project-explorer remove myproject
 
 - **Left sidebar** — project list with status indicators; click a project to scope all queries to it
 - **Chat area** — markdown-rendered responses with 👍/👎 feedback buttons on each message
-- **Charts** — Plotly.js charts (Stars, Commits, Languages, Health) rendered per selected project
+- **Charts** — Plotly.js charts (Stars, Commits, Languages, Health, **File Types**) rendered per selected project; the File Types chart uses Egeria-enriched type labels when a survey has been run, raw file extensions otherwise
 - **Clarification flow** — if the agent needs a project name, the response prompts you; click a project in the sidebar or type its name to re-run your original question
 
 ### TUI
@@ -330,6 +336,46 @@ Statistical and health queries never hit Milvus — they read directly from the 
 
 ---
 
+## Egeria Survey Integration
+
+`project-explorer survey <slug>` runs an Egeria-aligned analysis of any indexed project without requiring Egeria to be running.
+
+### What it analyses
+
+| Sub-surveyor | Egeria Annotation Type | What it checks |
+|---|---|---|
+| FileClassifier | `ClassificationAnnotation` | Every indexed file classified by type (Python Source, Markdown, YAML, …) using a local cache optionally refreshed from Egeria |
+| FileStructure | `ResourceMeasureAnnotation` | Total file count, repo size, lines of code, per-language and directory breakdown |
+| Language | `ClassificationAnnotation` | Primary and secondary languages, inferred project type (Library / CLI / Service / …) |
+| Health | `QualityScoreAnnotation` | Activity, community, release cadence, and freshness scores from GitHub stats |
+| Dependency | `DataClassAnnotation` | All dependencies grouped by ecosystem (PyPI, npm, Maven, …) |
+| Documentation | `ClassificationAnnotation` | Which doc collection types are present, which hygiene files exist (README, CHANGELOG, …), overall quality label |
+| Security | `RequestForAction` | Flags for missing SECURITY.md, no CI configuration, no license file |
+| ApiStructure | `SchemaAnalysis` | Public functions, classes, and module tree per language |
+
+### Survey flow
+
+```
+project-explorer survey myproject [--publish] [--refresh]
+        │
+        ├── reads: SQLite (project_stats, project_commits, project_code_symbols, project_dependencies)
+        ├── reads: Milvus (file_path metadata from all indexed collections)
+        ├── reads: FileTypeCache (data/file_type_cache.json — refreshed from Egeria when available)
+        │
+        ├── prints: markdown annotation report
+        ├── writes: project_file_type_counts (SQLite — powers the File Types chart; historical)
+        │
+        └── [--publish] → Egeria
+              ├── find/create SourceControlLibrary asset
+              ├── create SurveyReport linked via ReportSubject
+              ├── create one Annotation per finding
+              └── prompt: trigger governance action to catalog?
+```
+
+File type data is **appended** on each run (not replaced), so you can track how the composition of a project changes over time. The web File Types chart shows the most recent run with its timestamp.
+
+The `FileTypeCache` works fully offline — Egeria enriches the type labels (e.g. "Python Source" instead of `.py`) but is not required. If Egeria credentials are set, the cache is refreshed automatically when it is more than 24 hours old.
+
 ## Feedback Reranking
 
 Every query response includes a thumbs-up/down prompt. Feedback is used to boost or penalize chunk scores in future retrievals:
@@ -379,7 +425,7 @@ uv run mypy explorer/
 ```
 explorer/
 ├── config.py                  # Pydantic settings
-├── registry.py                # Project registry (SQLite: projects, project_stats, project_commits)
+├── registry.py                # Project registry (SQLite: projects, project_stats, project_commits, project_code_symbols, project_dependencies, project_file_type_counts)
 ├── rag_system.py              # Main query orchestrator
 ├── query_processor.py         # Intent classifier (routing.yaml patterns)
 ├── collection_router.py       # Collection selector
@@ -411,10 +457,17 @@ explorer/
 │   ├── health_agent.py        # Community health scoring (uses stats tools)
 │   └── conversation_agent.py  # Multi-turn session
 ├── cli/
-│   ├── main.py                # Typer CLI entry points (add, list, ask, chat, refresh, web, serve, tui, ...)
+│   ├── main.py                # Typer CLI entry points (add, list, ask, chat, refresh, survey, web, serve, tui, ...)
 │   ├── interactive.py         # REPL loop
 │   ├── wizard.py              # Add-project wizard
 │   └── formatters.py          # Rich output helpers
+├── surveyors/                 # Egeria-aligned survey framework
+│   ├── survey_report.py       # SurveyResult + Annotation dataclasses (7 Egeria subtypes)
+│   ├── base_surveyor.py       # Abstract BaseSurveyor
+│   ├── survey_orchestrator.py # Runs all sub-surveyors, assembles SurveyResult
+│   ├── egeria_publisher.py    # Publishes SurveyResult to Egeria via pyegeria
+│   ├── file_classifier/       # FileClassifier + FileTypeCache (offline-capable, Egeria-enhanced)
+│   └── sub_surveyors/         # file_structure, language, health, dependency, documentation, security, api_structure
 ├── web/
 │   ├── app.py                 # FastAPI application
 │   ├── static/

@@ -106,6 +106,13 @@ class ConversationAgent(BaseExplorerAgent):
     def handle(self, query: str, project_slug: str | None = None, **kwargs) -> str:
         slug = project_slug or self.project_slug or self._infer_project_slug(query)
 
+        # Delegate example generation to the specialist — BeeAI + small models produce
+        # incomplete responses for this intent without the dedicated context/fallback loop.
+        from explorer.query_processor import QueryProcessor, QueryIntent
+        if QueryProcessor().classify(query) == QueryIntent.EXAMPLES:
+            from explorer.agents.examples_agent import ExamplesAgent
+            return ExamplesAgent().handle(query, project_slug=slug)
+
         lines: list[str] = []
         if slug:
             lines.append(f"Project: {slug}")

@@ -382,5 +382,112 @@ def aliases_remove(
         console.print(f'[yellow]Alias "{alias}" not found.[/yellow]')
 
 
+@app.command()
+def survey(
+    slug: str = typer.Argument(help="Project slug to survey"),
+    publish: bool = typer.Option(False, "--publish", help="Push the survey report to Egeria"),
+    refresh_cache: bool = typer.Option(False, "--refresh", help="Force-refresh the file type cache from Egeria before surveying"),
+    platform_url: Optional[str] = typer.Option(None, "--egeria-url", help="Egeria platform URL (overrides EGERIA_PLATFORM_URL env var)"),
+    view_server: Optional[str] = typer.Option(None, "--egeria-server", help="Egeria view server name (overrides EGERIA_VIEW_SERVER)"),
+):
+    """Survey a project and produce an Egeria-aligned annotation report.
+
+    Without --publish: prints the survey as a markdown report (no Egeria required).
+
+    With --publish: also pushes the SurveyReport and all Annotations to Egeria,
+    then offers to trigger a governance action process to catalog the asset.
+    """
+    from explorer.registry import ProjectRegistry
+    from explorer.surveyors.survey_orchestrator import SurveyOrchestrator
+    from explorer.surveyors.survey_report import AnnotationType
+
+    registry = ProjectRegistry()
+    project = registry.get(slug)
+    if project is None:
+        console.print(f"[red]Project '{slug}' not found. Run 'project-explorer list' to see registered projects.[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]Surveying [bold]{project.display_name}[/bold] …[/cyan]")
+
+    # Optional: connect to Egeria for cache refresh even without --publish
+    pyegeria_client = None
+    if refresh_cache or publish:
+        pyegeria_client = _try_build_egeria_client(platform_url, view_server)
+
+    orchestrator = SurveyOrchestrator(
+        registry=registry,
+        pyegeria_client=pyegeria_client,
+        force_refresh=refresh_cache,
+    )
+    result = orchestrator.run(slug)
+
+    # ── Markdown report ───────────────────────────────────────────────────────
+    console.print(f"\n[bold]Survey Report: {result.project_display_name}[/bold]")
+    console.print(f"GitHub: {result.github_url}")
+    console.print(f"Surveyed at: {result.surveyed_at.isoformat()}")
+    console.print(f"Annotations: {len(result.annotations)}  |  Errors: {len(result.errors)}\n")
+
+    for ann_type in AnnotationType:
+        group = result.by_type(ann_type)
+        if not group:
+            continue
+        console.print(f"[bold yellow]{ann_type.value}[/bold yellow] ({len(group)})")
+        for ann in group:
+            console.print(f"  • {ann.summary}")
+            if ann.explanation:
+                console.print(f"    [dim]{ann.explanation}[/dim]")
+        console.print()
+
+    if result.errors:
+        console.print("[bold red]Survey errors:[/bold red]")
+        for err in result.errors:
+            console.print(f"  [red]• {err}[/red]")
+        console.print()
+
+    # ── Egeria publish ────────────────────────────────────────────────────────
+    if publish:
+        from explorer.surveyors.egeria_publisher import EgeriaConnectionError, EgeriaPublisher
+        try:
+            publisher = EgeriaPublisher(
+                platform_url=platform_url,
+                view_server=view_server,
+            )
+            console.print("[cyan]Publishing to Egeria …[/cyan]")
+            report_guid = publisher.publish(result)
+            console.print(f"[green]SurveyReport created: GUID {report_guid}[/green]")
+
+            # Governance action prompt (kept deliberate and opt-in)
+            catalog = typer.confirm(
+                "\nTrigger governance action process to catalog this asset in Egeria?",
+                default=False,
+            )
+            if catalog:
+                console.print(
+                    "[yellow]Governance action integration is not yet implemented — "
+                    "watch for this in a future release.[/yellow]"
+                )
+        except EgeriaConnectionError as exc:
+            console.print(f"[red]Egeria connection failed: {exc}[/red]")
+            raise typer.Exit(1)
+
+
+def _try_build_egeria_client(platform_url: Optional[str], view_server: Optional[str]):
+    """Attempt to build a pyegeria client for optional cache refresh. Returns None on failure."""
+    import os
+    url = platform_url or os.getenv("EGERIA_PLATFORM_URL", "")
+    server = view_server or os.getenv("EGERIA_VIEW_SERVER", "")
+    user = os.getenv("EGERIA_USER", "")
+    password = os.getenv("EGERIA_USER_PASSWORD", "")
+    if not url:
+        return None
+    try:
+        from pyegeria import ValidMetadataManager
+        client = ValidMetadataManager(server, url, user, password)
+        client.create_egeria_bearer_token(user, password)
+        return client
+    except Exception:
+        return None
+
+
 if __name__ == "__main__":
     app()

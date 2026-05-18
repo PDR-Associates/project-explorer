@@ -1,0 +1,194 @@
+"""
+Sub-surveyor: File Classification
+
+Walks the project's indexed file paths (from project_code_symbols + registry
+collections) and produces:
+  - One ClassificationAnnotation per distinct (deployedImplementationType, fileType)
+    group summarising what categories of files were found.
+  - One ResourceMeasureAnnotation with aggregate counts per file extension.
+
+Runs in all cases — with or without Egeria credentials.  When Egeria
+credentials are available the FileTypeCache is refreshed first, giving richer
+classifications; when offline the last-persisted cache is used.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from collections import Counter, defaultdict
+from pathlib import Path
+
+from explorer.registry import Project, ProjectRegistry
+from explorer.surveyors.base_surveyor import BaseSurveyor
+from explorer.surveyors.file_classifier.file_classifier import FileClassifier
+from explorer.surveyors.file_classifier.type_cache import get_cache
+from explorer.surveyors.survey_report import (
+    Annotation,
+    ClassificationAnnotation,
+    ResourceMeasureAnnotation,
+)
+
+log = logging.getLogger(__name__)
+
+
+class FileClassifierSurveyor(BaseSurveyor):
+    """
+    Wraps the existing FileClassifier to produce survey annotations.
+
+    Parameters
+    ----------
+    project         : Project from registry
+    registry        : open ProjectRegistry
+    pyegeria_client : optional — if provided the FileTypeCache is refreshed
+                      from Egeria's ValidMetadataValues before classification.
+    force_refresh   : force a cache refresh even if not stale
+    """
+
+    STEP = "FileClassification"
+
+    def __init__(
+        self,
+        project: Project,
+        registry: ProjectRegistry,
+        pyegeria_client=None,
+        force_refresh: bool = False,
+    ) -> None:
+        super().__init__(project, registry)
+        self._pyegeria_client = pyegeria_client
+        self._force_refresh = force_refresh
+
+    @property
+    def step_name(self) -> str:
+        return self.STEP
+
+    def run(self) -> list[Annotation]:
+        results: list[Annotation] = []
+        try:
+            cache = get_cache()
+            if self._pyegeria_client and (self._force_refresh or cache.needs_refresh()):
+                cache.refresh_from_egeria(self._pyegeria_client)
+
+            classifier = FileClassifier(pyegeria_client=None)  # use cache-backed lookup
+            classifier.fileNameReferenceDataCache = {}          # reset instance cache
+            classifier.fileExtensionReferenceDataCache = {}
+
+            file_paths = self._collect_file_paths()
+            if not file_paths:
+                self._warn(results, "No file paths found in registry for this project.")
+                return results
+
+            ext_counter: Counter = Counter()
+            # recognized label → list of file paths
+            type_groups: dict[str, list[str]] = defaultdict(list)
+            # unrecognized files bucketed into "Other"; track extension breakdown
+            other_ext_counter: Counter = Counter()
+            other_paths: list[str] = []
+
+            for path_str in file_paths:
+                p = Path(path_str)
+                ext = classifier.get_file_extension(p.name) or "(none)"
+                ext_counter[ext] += 1
+
+                meta = cache.lookup(p.name, classifier.get_file_extension(p.name))
+                label = (
+                    meta.get("deployedImplementationType")
+                    or meta.get("fileType")
+                    or meta.get("assetTypeName")
+                )
+                if label:
+                    type_groups[label].append(path_str)
+                else:
+                    other_ext_counter[ext] += 1
+                    other_paths.append(path_str)
+
+            # One ClassificationAnnotation per recognized type group
+            for label, paths in sorted(type_groups.items()):
+                results.append(
+                    ClassificationAnnotation(
+                        summary=f"{len(paths)} file(s) classified as '{label}'",
+                        analysis_step=self.STEP,
+                        candidate_classifications=[label],
+                        confidence=90,
+                        json_properties={
+                            "file_count": len(paths),
+                            "sample_paths": paths[:5],
+                        },
+                    )
+                )
+
+            # All unrecognized files → single "Other" annotation with extension breakdown
+            if other_paths:
+                results.append(
+                    ClassificationAnnotation(
+                        summary=f"{len(other_paths)} file(s) with unrecognized type",
+                        analysis_step=self.STEP,
+                        candidate_classifications=["Other"],
+                        confidence=50,
+                        json_properties={
+                            "file_count": len(other_paths),
+                            "unrecognized_extensions": dict(other_ext_counter.most_common()),
+                            "sample_paths": other_paths[:5],
+                        },
+                    )
+                )
+                type_groups["Other"] = other_paths
+
+            # One ResourceMeasureAnnotation with full extension breakdown
+            results.append(
+                ResourceMeasureAnnotation(
+                    summary=f"File extension breakdown across {len(file_paths)} indexed files",
+                    analysis_step=self.STEP,
+                    resource_properties={"by_extension": dict(ext_counter.most_common())},
+                    json_properties={
+                        "total_files": len(file_paths),
+                        "unrecognized_extensions": dict(other_ext_counter.most_common()),
+                    },
+                )
+            )
+
+            # Persist type group counts to SQLite so the web chart can use them.
+            type_counts = {label: len(paths) for label, paths in type_groups.items()}
+            source = "egeria" if self._pyegeria_client or not cache.needs_refresh() else "extension"
+            details: dict[str, dict] = {}
+            if other_ext_counter:
+                details["Other"] = dict(other_ext_counter.most_common())
+            try:
+                self.registry.upsert_file_type_counts(
+                    self.project.slug, type_counts, source=source, details=details
+                )
+            except Exception as exc:
+                log.warning("FileClassifierSurveyor: could not persist type counts: %s", exc)
+
+        except Exception as exc:
+            log.exception("FileClassifierSurveyor failed for %s", self.project.slug)
+            self._warn(results, str(exc))
+
+        return results
+
+    def _collect_file_paths(self) -> list[str]:
+        """Return all indexed file paths: code symbols (SQLite) + all Milvus collections."""
+        slug = self.project.slug
+
+        # Code files — fast SQLite lookup
+        with self.registry._conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT file_path FROM project_code_symbols WHERE project_slug = ?",
+                (slug,),
+            ).fetchall()
+        paths: set[str] = {r["file_path"] for r in rows}
+
+        code_count = len(paths)
+
+        # Doc / example / API files — stored in Milvus metadata, not in SQLite
+        project = self.registry.get(slug)
+        if project and project.collections:
+            from explorer.multi_collection_store import MultiCollectionStore
+            store = MultiCollectionStore()
+            milvus_paths = store.list_source_files(project.collections)
+            paths.update(p for p in milvus_paths if p and not p.startswith("http"))
+
+        log.debug(
+            "_collect_file_paths: %s → %d code + %d milvus = %d total",
+            slug, code_count, len(paths) - code_count, len(paths),
+        )
+        return list(paths)

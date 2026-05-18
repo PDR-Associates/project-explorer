@@ -137,7 +137,7 @@ class StatsAgent(BaseExplorerAgent):
             f"  Primary language:   {_val('primary_language')}",
             "",
             "── Code ────────────────────────────────",
-            f"  Files:              {_val('ingestion_file_count') if d.get('ingestion_file_count') is not None else _val('file_count')}",
+            f"  Files:              {self._indexed_file_count(project_slug, registry)}",
             f"  Lines of code:      {_loc_fmt(d.get('ingestion_lines_of_code'), exact=True) if d.get('ingestion_lines_of_code') is not None else _loc_fmt(d.get('lines_of_code'))}",
             f"  Language breakdown: {_val('language_breakdown')}",
             "",
@@ -178,6 +178,25 @@ class StatsAgent(BaseExplorerAgent):
             lines += ["", commit_section]
 
         return "\n".join(lines)
+
+    def _indexed_file_count(self, slug: str, registry) -> str:
+        """Count distinct file paths in project_code_symbols — reliable even when GitHub API returns null."""
+        try:
+            conn = sqlite3.connect(registry.db_path)
+            n = conn.execute(
+                "SELECT COUNT(DISTINCT file_path) FROM project_code_symbols WHERE project_slug = ?",
+                (slug,),
+            ).fetchone()[0]
+            conn.close()
+            if n:
+                return f"{n} (indexed)"
+        except Exception:
+            pass
+        d = getattr(self, '_last_stats_row', {})
+        if d.get('ingestion_file_count') is not None:
+            return str(d['ingestion_file_count'])
+        v = d.get('file_count')
+        return str(v) if v is not None else "N/A"
 
     def _format_commit_trends(self, commit_rows) -> str:
         from collections import Counter, defaultdict

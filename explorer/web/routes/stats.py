@@ -146,6 +146,14 @@ async def compare_stats_chart(slugs: str) -> dict:
     return json.loads(fig.to_json())
 
 
+@router.get("/{slug}/charts/file_types")
+async def file_types_chart(slug: str) -> dict:
+    """Return Plotly figure JSON for the file-count-by-extension bar chart."""
+    from explorer.dashboard.graphs import file_types_plotly
+    fig = file_types_plotly(slug)
+    return json.loads(fig.to_json())
+
+
 @router.get("/{slug}/charts/health")
 async def health_chart(slug: str) -> dict:
     """Return Plotly figure JSON for the project-health radar chart."""

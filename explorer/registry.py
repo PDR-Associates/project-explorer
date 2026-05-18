@@ -242,6 +242,30 @@ class ProjectRegistry:
                 "CREATE INDEX IF NOT EXISTS idx_deps_name "
                 "ON project_dependencies(dep_name)"
             )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS project_file_type_counts (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_slug TEXT NOT NULL,
+                    surveyed_at  TEXT NOT NULL,
+                    type_label   TEXT NOT NULL,
+                    file_count   INTEGER NOT NULL,
+                    source       TEXT DEFAULT 'extension',
+                    details_json TEXT DEFAULT NULL,
+                    FOREIGN KEY (project_slug) REFERENCES projects(slug)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_file_type_slug "
+                "ON project_file_type_counts(project_slug)"
+            )
+            # Migration: add details_json if not present (existing databases)
+            existing_ftc = {r[1] for r in conn.execute(
+                "PRAGMA table_info(project_file_type_counts)"
+            ).fetchall()}
+            if "details_json" not in existing_ftc:
+                conn.execute(
+                    "ALTER TABLE project_file_type_counts ADD COLUMN details_json TEXT DEFAULT NULL"
+                )
 
     def add(self, project: Project) -> None:
         data = {
@@ -469,6 +493,65 @@ class ProjectRegistry:
                     display_term = " ".join(words[i:i + n])
                     return display_term, candidates[matches[0]]
         return None
+
+    # ── file type counts (from surveyor) ─────────────────────────────────────
+
+    def upsert_file_type_counts(
+        self,
+        slug: str,
+        counts: dict[str, int],
+        source: str = "extension",
+        details: dict[str, dict] | None = None,
+    ) -> None:
+        """Append a new survey run's file-type counts. Historical runs are kept for trending.
+
+        details: optional per-label breakdown dict (e.g. {"Other": {".toml": 5, ".yaml": 3}})
+        """
+        slug = self._normalize_slug(slug)
+        surveyed_at = datetime.utcnow().isoformat()
+        details = details or {}
+        with self._conn() as conn:
+            conn.executemany(
+                "INSERT INTO project_file_type_counts "
+                "(project_slug, surveyed_at, type_label, file_count, source, details_json) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (slug, surveyed_at, label, count, source,
+                     json.dumps(details[label]) if label in details else None)
+                    for label, count in counts.items()
+                ],
+            )
+
+    def query_file_type_counts(self, slug: str) -> list[dict]:
+        """Return the most recent survey run's file-type counts, ordered by count desc.
+        Each row includes surveyed_at so callers can display when the survey ran."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            latest_ts = conn.execute(
+                "SELECT MAX(surveyed_at) FROM project_file_type_counts WHERE project_slug = ?",
+                (slug,),
+            ).fetchone()[0]
+            if not latest_ts:
+                return []
+            rows = conn.execute(
+                "SELECT type_label, file_count, source, surveyed_at, details_json "
+                "FROM project_file_type_counts "
+                "WHERE project_slug = ? AND surveyed_at = ? ORDER BY file_count DESC",
+                (slug, latest_ts),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def query_file_type_history(self, slug: str) -> list[dict]:
+        """Return one row per survey run with total file count and timestamp, for trending."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT surveyed_at, SUM(file_count) as total_files, source "
+                "FROM project_file_type_counts WHERE project_slug = ? "
+                "GROUP BY surveyed_at ORDER BY surveyed_at ASC",
+                (slug,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ── dependency graph ──────────────────────────────────────────────────────
 

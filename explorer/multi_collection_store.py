@@ -28,6 +28,14 @@ class MultiCollectionStore:
     _TEXT_MAX_LEN = 65_535
     _META_MAX_LEN = 65_535
 
+    @staticmethod
+    def _trunc(s: str, max_bytes: int) -> str:
+        """Truncate to max_bytes UTF-8 bytes without splitting a multi-byte character."""
+        encoded = s.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return s
+        return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
     def __init__(self) -> None:
         self._cfg = get_config()
         self._client = None  # lazy-initialized on first use
@@ -137,8 +145,8 @@ class MultiCollectionStore:
         data = [
             {
                 "vector": vec,
-                "text": text[: self._TEXT_MAX_LEN],
-                "metadata_json": json.dumps(meta)[: self._META_MAX_LEN],
+                "text": self._trunc(text, self._TEXT_MAX_LEN),
+                "metadata_json": self._trunc(json.dumps(meta), self._META_MAX_LEN),
             }
             for vec, text, meta in zip(vectors, texts, metadatas)
         ]
@@ -157,3 +165,37 @@ class MultiCollectionStore:
             return 0
         stats = client.get_collection_stats(collection)
         return int(stats.get("row_count", 0))
+
+    def list_source_files(self, collections: list[str], batch_size: int = 16384) -> list[str]:
+        """Return unique file_path values from metadata_json across the given collections.
+
+        Uses MilvusClient.query() (no vector required).  For very large collections
+        only the first `batch_size` records are scanned — sufficient for file-type
+        classification because the goal is coverage of types, not an exact manifest.
+        """
+        import logging
+        _log = logging.getLogger(__name__)
+        client = self._get_client()
+        paths: set[str] = set()
+        for collection in collections:
+            if not client.has_collection(collection):
+                continue
+            try:
+                rows = client.query(
+                    collection_name=collection,
+                    filter="id >= 0",
+                    output_fields=["metadata_json"],
+                    limit=batch_size,
+                )
+                _log.debug("list_source_files: %s → %d rows", collection, len(rows))
+                for row in rows:
+                    try:
+                        meta = json.loads(row.get("metadata_json") or "{}")
+                        fp = meta.get("file_path") or meta.get("source_url") or ""
+                        if fp:
+                            paths.add(fp)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                _log.warning("list_source_files: query failed for %s: %s", collection, exc)
+        return list(paths)

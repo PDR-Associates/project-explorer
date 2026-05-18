@@ -83,6 +83,23 @@ def query_project_stats(project_slug: str, days: int = 90) -> str:
     kb = d.get("repo_size_kb")
     size_str = f"{int(kb) / 1024:.1f} MB" if kb and int(kb) >= 1024 else (f"{kb} KB" if kb else "N/A")
 
+    # Count indexed files from code symbols — reliable even when GitHub API returns null
+    try:
+        _cs_conn = sqlite3.connect(registry.db_path)
+        indexed_files = _cs_conn.execute(
+            "SELECT COUNT(DISTINCT file_path) FROM project_code_symbols WHERE project_slug = ?",
+            (slug,),
+        ).fetchone()[0]
+        _cs_conn.close()
+    except Exception:
+        indexed_files = None
+
+    file_count_str = (
+        f"{indexed_files} (indexed)"
+        if indexed_files
+        else (v('ingestion_file_count') if d.get('ingestion_file_count') is not None else v('file_count'))
+    )
+
     lines = [
         f"Project: {slug}  (stats as of {v('fetched_at')[:19]})",
         f"Stars: {v('stars')}  Forks: {v('forks')}  Watchers: {v('watchers')}  Open issues: {v('open_issues')}",
@@ -93,7 +110,7 @@ def query_project_stats(project_slug: str, days: int = 90) -> str:
     lines += [
         f"Releases: {v('releases_count')}  Latest: {v('latest_release')} ({v('latest_release_at')[:10]})",
         f"Avg release interval: {v('avg_release_interval_days')} days",
-        f"Primary language: {v('primary_language')}  LOC: {loc_str}  Files: {v('file_count')}  Size: {size_str}",
+        f"Primary language: {v('primary_language')}  LOC: {loc_str}  Files: {file_count_str}  Size: {size_str}",
         f"Languages: {v('language_breakdown')}",
         f"License: {v('license')}  Topics: {v('topics')}",
         f"Created: {v('repo_created_at')[:10]}  Last pushed: {v('last_pushed_at')[:10]}",

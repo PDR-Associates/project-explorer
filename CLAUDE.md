@@ -101,6 +101,11 @@ project-explorer remove myproject
 # Launch full-screen TUI
 project-explorer tui
 
+# Survey a project (Egeria-aligned annotation report — no Egeria required by default)
+project-explorer survey myproject
+project-explorer survey myproject --publish          # also push SurveyReport + Annotations to Egeria
+project-explorer survey myproject --refresh          # force-refresh FileTypeCache from Egeria first
+
 # Launch browser-based web UI (Plotly charts + markdown rendering)
 project-explorer web
 project-explorer web --host 0.0.0.0 --port 8080 --reload
@@ -181,8 +186,49 @@ Stats and Health use async generators with `yield TaskStatus(state=TaskState.inp
 - Tailwind CSS (CDN), marked.js (CDN), Plotly.js (CDN)
 - Left sidebar: project list with status badges; click to scope queries
 - Chat area: markdown-rendered responses, 👍/👎 feedback on each message
-- Charts: Stars, Commits, Languages, Health — fetched as Plotly JSON from `/api/stats/{slug}/charts/{type}`
+- Charts: Stars, Commits, Languages, Health, **File Types** — fetched as Plotly JSON from `/api/stats/{slug}/charts/{type}`
+  - File Types chart prefers surveyor data from `project_file_type_counts` (Egeria-enriched labels + survey timestamp); falls back to raw extension counts from `project_code_symbols`
+- Chart auto-selection (`_pick_chart` in `web/routes/query.py`): keywords in the query select the relevant chart; unrecognised statistical queries return no chart rather than a default commit graph
 - Clarification flow: detects "Which project are you asking about?" prefix; sidebar click or typed name re-runs original query
+
+### Egeria Surveyor
+
+`project-explorer survey <slug>` runs the survey framework and prints a markdown report. `--publish` additionally pushes to Egeria.
+
+Survey flow:
+```
+SurveyOrchestrator.run(slug)
+  → FileClassifierSurveyor   (FileTypeCache → ClassificationAnnotation per type group)
+  → FileStructureSurveyor    (project_stats + code_symbols → ResourceMeasureAnnotation)
+  → LanguageSurveyor         (language_breakdown → ClassificationAnnotation)
+  → HealthSurveyor           (stars/commits/releases → QualityScoreAnnotation)
+  → DependencySurveyor       (project_dependencies → DataClassAnnotation per ecosystem)
+  → DocumentationSurveyor    (collection presence + hygiene files → ClassificationAnnotation)
+  → SecuritySurveyor         (SECURITY.md / CI / license → RequestForAction for gaps)
+  → ApiStructureSurveyor     (project_code_symbols → SchemaAnalysisAnnotation per language)
+  → SurveyResult (plain dataclasses, no pyegeria dependency)
+
+  [--publish] → EgeriaPublisher
+    → find/create SourceControlLibrary asset  (placeholder — pending pyegeria support)
+    → create SurveyReport linked via ReportSubject
+    → create one Annotation per SurveyResult.annotation
+    → optional: prompt to trigger governance action process
+```
+
+`FileTypeCache` (`surveyors/file_classifier/type_cache.py`):
+- Persists to `data/file_type_cache.json`; refreshed from Egeria `ValidMetadataValues` when credentials present
+- Works fully offline using last-known cache — Egeria is an enhancement, not a hard dependency
+- Module-level singleton shared across all surveyors in a process
+
+`project_file_type_counts` SQLite table:
+- Populated by `FileClassifierSurveyor` on every survey run (appended, not replaced)
+- Columns: `project_slug`, `surveyed_at`, `type_label`, `file_count`, `source` (`"egeria"` or `"extension"`)
+- Read by `file_types_plotly()` for the web File Types chart; `query_file_type_history()` returns one row per run for trending
+
+Egeria connection (all optional, standard pyegeria env vars):
+```
+EGERIA_PLATFORM_URL, EGERIA_VIEW_SERVER, EGERIA_USER, EGERIA_USER_PASSWORD, PYEGERIA_TIMEOUT_SECONDS
+```
 
 ### TUI (Textual)
 
@@ -228,6 +274,10 @@ Not every project gets every collection — `RepoAnalyzer` inspects the repo and
 14. BeeAI `FunctionTool` objects (produced by `@tool`) have no `.func` attribute — calling `my_tool.func(...)` raises `AttributeError`. To call tool logic outside the agent loop (e.g., in a `_fallback()` method), extract the implementation into a `_<name>_raw()` plain function and have the `@tool` wrapper delegate to it; the fallback imports and calls the raw function directly. See `_build_example_context_raw` and `_query_code_symbols_raw` in `agents/tools.py`.
 15. `ExamplesAgent._fallback()` is the reliable path for example generation with small models — BeeAI + llama3.1:8b frequently completes without calling any tools and returns a plain-text method list. Gate on `"```python" in response` (not just `"```"`) so inline-backtick responses still fall through to the fallback. Index the project's functional/scenario tests as extra-docs-paths to give the fallback retrieval concrete, correct constructor signatures to work from.
 16. `routing.yaml` `examples` patterns must appear before `code_search` patterns that would otherwise absorb "show me an example of X" and "how do I use X". Use single-quoted strings for all patterns containing `\w` or other regex metacharacters.
+17. Milvus `VARCHAR` `max_length` is a **UTF-8 byte limit**, not a Python character limit — `text[:65535]` can still exceed 65535 bytes when the text contains multi-byte Unicode. Always truncate via `encoded[:max_bytes].decode('utf-8', errors='ignore')`. See `MultiCollectionStore._trunc()` in `multi_collection_store.py`.
+18. `StatsAgent` file count must come from `COUNT(DISTINCT file_path)` in `project_code_symbols`, not from the GitHub API `file_count` field (which is frequently NULL). When the LLM sees `N/A` for file count it hallucinates symbol counts instead — the system prompt must explicitly instruct it to report the `Files:` field and not substitute code symbol information.
+19. `_pick_chart()` in `web/routes/query.py` must return `None` for statistical queries that don't match a specific keyword — the previous catch-all `else` always returned the commit chart, misleading users asking about files, contributors, etc. Add keyword branches for each chart type and let the default be no chart.
+20. Surveyor results (`project_file_type_counts`) are appended, not replaced — each survey run adds a new dated batch so file-type trends can be tracked over time. `query_file_type_counts()` returns only the latest run; `query_file_type_history()` returns one row per run for trending.
 
 
 ## Module Map
@@ -235,7 +285,7 @@ Not every project gets every collection — `RepoAnalyzer` inspects the repo and
 ```
 explorer/
 ├── config.py              # Pydantic settings (ExplorerConfig)
-├── registry.py            # Project Registry (SQLite: projects, project_stats, project_commits); Project dataclass includes subproject_path, parent_slug, extra_docs_paths
+├── registry.py            # Project Registry (SQLite: projects, project_stats, project_commits, project_code_symbols, project_dependencies, project_file_type_counts); Project dataclass includes subproject_path, parent_slug, extra_docs_paths
 ├── rag_system.py          # Main orchestrator — entry point for all queries
 ├── query_processor.py     # Intent classifier + agent router
 ├── collection_router.py   # Selects relevant collections per query
@@ -254,14 +304,33 @@ explorer/
 │   ├── examples_agent.py  # Generates complete runnable Python examples (EXAMPLES intent)
 │   └── conversation_agent.py  # Multi-turn BeeAI session wrapper
 ├── cli/
-│   └── main.py            # Typer app (add, list, ask, chat, refresh, web, serve, tui, ...)
+│   └── main.py            # Typer app (add, list, ask, chat, refresh, survey, web, serve, tui, ...)
 ├── web/
 │   ├── app.py             # FastAPI application
 │   ├── static/index.html  # Single-page UI (Tailwind, Plotly.js, marked.js)
-│   └── routes/            # query.py (feedback endpoint), projects.py, stats.py
+│   └── routes/            # query.py (_pick_chart keyword routing), projects.py, stats.py
 ├── tui/
 │   └── app.py             # Textual full-screen TUI (clarification-aware)
 ├── dashboard/
+│   └── graphs.py          # Plotly figure builders incl. file_types_plotly (prefers surveyor data)
+├── surveyors/             # Egeria-aligned survey framework (no pyegeria dependency except publisher)
+│   ├── survey_report.py   # SurveyResult + Annotation dataclasses (AnnotationType enum, 7 subtypes)
+│   ├── base_surveyor.py   # Abstract BaseSurveyor; _warn() records errors as RequestForAction
+│   ├── survey_orchestrator.py  # Runs all sub-surveyors → SurveyResult; catches per-surveyor failures
+│   ├── egeria_publisher.py     # SurveyResult → pyegeria API (SurveyReport + Annotations); SourceControlLibrary placeholder
+│   ├── file_classifier/
+│   │   ├── file_classificaiton.py   # FileClassification dataclass
+│   │   ├── file_classifier.py       # FileClassifier (filesystem attrs + Egeria ValidMetadataValues lookup)
+│   │   ├── file_classifier_surveyor.py  # Sub-surveyor: ClassificationAnnotation + ResourceMeasureAnnotation per type group; persists to project_file_type_counts
+│   │   └── type_cache.py            # FileTypeCache — JSON-persisted local cache of Egeria file-type mappings; refreshed from Egeria when credentials present, works offline otherwise
+│   └── sub_surveyors/
+│       ├── file_structure.py  # → ResourceMeasureAnnotation (file counts, sizes, LOC, dir breakdown)
+│       ├── language.py        # → ClassificationAnnotation (primary/secondary language, project type)
+│       ├── dependency.py      # → DataClassAnnotation per ecosystem + ResourceMeasureAnnotation totals
+│       ├── api_structure.py   # → SchemaAnalysisAnnotation per language (module tree, public symbols)
+│       ├── health.py          # → QualityScoreAnnotation (activity, community, release cadence, freshness)
+│       ├── documentation.py   # → ClassificationAnnotation (collection presence, hygiene files, quality label)
+│       └── security.py        # → RequestForActionAnnotation (missing SECURITY.md, CI, license)
 └── observability/
 ```
 

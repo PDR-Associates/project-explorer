@@ -121,8 +121,14 @@ def _pick_chart(query: str, intent: str, project_slug: str) -> dict | None:
         elif any(w in q for w in ("week", "weekly", "per week", "week-by-week")):
             fig = graphs.weekly_commits_plotly(project_slug)
 
-        else:
+        elif any(w in q for w in ("file", "files", "file type", "file count", "how many file")):
+            fig = graphs.file_types_plotly(project_slug)
+
+        elif any(w in q for w in ("commit", "activity", "history", "how many commit")):
             fig = graphs.commits_over_time_plotly(project_slug)
+
+        else:
+            return None
 
         return json.loads(fig.to_json())
     except Exception:

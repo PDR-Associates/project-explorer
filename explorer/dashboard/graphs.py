@@ -279,6 +279,102 @@ def compare_stats_plotly(project_slugs: list[str]) -> "plotly.graph_objects.Figu
     return fig
 
 
+def file_types_plotly(project_slug: str) -> "plotly.graph_objects.Figure":
+    """Return a Plotly horizontal bar chart of file counts by type.
+
+    Prefers surveyor data (Egeria-enriched type labels) stored in
+    project_file_type_counts.  Falls back to counting raw extensions
+    from project_code_symbols when no survey has been run.
+    """
+    import plotly.graph_objects as go
+    from collections import Counter
+
+    registry = ProjectRegistry()
+    subtitle = ""
+
+    # ── prefer persisted surveyor data ───────────────────────────────────────
+    surveyor_rows = registry.query_file_type_counts(project_slug)
+    hover_texts: list[str] = []
+    if surveyor_rows:
+        labels = [r["type_label"] for r in surveyor_rows]
+        counts = [r["file_count"] for r in surveyor_rows]
+        source = surveyor_rows[0].get("source", "extension")
+        ts = (surveyor_rows[0].get("surveyed_at") or "")[:16].replace("T", " ")
+        source_label = "Egeria-classified" if source == "egeria" else "by extension"
+        subtitle = f"Surveyed {ts} UTC · {source_label}"
+        # Build hover text: for "Other" include extension breakdown
+        for r in surveyor_rows:
+            if r["type_label"] == "Other" and r.get("details_json"):
+                try:
+                    breakdown = json.loads(r["details_json"])
+                    lines = [f"{ext}: {n}" for ext, n in list(breakdown.items())[:10]]
+                    hover_texts.append("Unrecognized types:<br>" + "<br>".join(lines))
+                except Exception:
+                    hover_texts.append(str(r["file_count"]))
+            else:
+                hover_texts.append(str(r["file_count"]))
+        # Cap at 25, already sorted desc by registry
+        labels, counts, hover_texts = labels[:25], counts[:25], hover_texts[:25]
+        labels, counts, hover_texts = (
+            list(reversed(labels)), list(reversed(counts)), list(reversed(hover_texts))
+        )
+    else:
+        # ── fallback: raw extension count from code symbols ───────────────────
+        subtitle = "by extension (run 'project-explorer survey' for richer labels)"
+        try:
+            conn = sqlite3.connect(registry.db_path)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT DISTINCT file_path FROM project_code_symbols WHERE project_slug = ?",
+                (project_slug,),
+            ).fetchall()
+            conn.close()
+        except Exception:
+            rows = []
+
+        counter: Counter = Counter()
+        for row in rows:
+            path = row["file_path"].replace("\\", "/")
+            name = path.rsplit("/", 1)[-1]
+            if name.startswith(".") and name.count(".") == 1:
+                ext = name
+            elif "." in name:
+                ext = "." + name.rsplit(".", 1)[-1].lower()
+            else:
+                ext = "(no extension)"
+            counter[ext] += 1
+
+        if not counter:
+            fig = go.Figure()
+            fig.update_layout(title=f"No file data — {project_slug}")
+            return fig
+
+        top = counter.most_common(25)
+        labels = [t[0] for t in reversed(top)]
+        counts = [t[1] for t in reversed(top)]
+        hover_texts = [str(c) for c in counts]
+
+    fig = go.Figure(go.Bar(
+        x=counts,
+        y=labels,
+        orientation="h",
+        marker_color="#8b5cf6",
+        text=counts,
+        textposition="outside",
+        hovertext=hover_texts,
+        hovertemplate="%{y}: %{hovertext}<extra></extra>",
+    ))
+    fig.update_layout(
+        title=f"Files by type — {project_slug}<br><sup>{subtitle}</sup>",
+        xaxis_title="File count",
+        margin={"l": 10, "r": 40, "t": 50, "b": 10},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#94a3b8"},
+    )
+    return fig
+
+
 def health_radar_plotly(project_slug: str) -> "plotly.graph_objects.Figure":
     """Return a Plotly radar chart of project health dimensions."""
     import plotly.graph_objects as go
