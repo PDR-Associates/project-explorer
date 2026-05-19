@@ -172,28 +172,57 @@ If none are set, pyegeria falls back to its own `config/config.json`. `EgeriaPub
 
 ## Implementation Notes
 
-### File path collection — two sources required
+### File path collection — full inventory (primary) + fallback sources
 
-`FileClassifierSurveyor._collect_file_paths()` must query **both** sources:
+`FileClassifierSurveyor._collect_file_paths()` uses **`project_file_inventory`** as its primary source when available. This table is populated during every `add` and `refresh` by `IngestionPipeline._store_file_inventory()`, which walks the downloaded repo directory and stores every file path and size. It gives the surveyor a complete view of the repo — including YAML CI configs, shell scripts, TOML manifests, and anything else that isn't vectorised.
 
-1. `project_code_symbols` (SQLite) — code files only (Python, JS, Java, Go); fast
-2. `MultiCollectionStore.list_source_files(collections)` (Milvus) — all other indexed content (Markdown, TOML, YAML, examples, PDFs, release notes…) whose `file_path` is stored in `metadata_json` per chunk
+For projects indexed before the inventory table was added, the surveyor falls back to three partial sources:
 
-Using only `project_code_symbols` (the original implementation) caused the surveyor to report only `.py` files, missing all doc and config file types.
+1. `project_code_symbols` (SQLite) — Python/JS/Java/Go source files only
+2. `MultiCollectionStore.list_source_files(collections)` (Milvus) — markdown, examples, release notes, PDFs (stored as `file_path` in `metadata_json`)
+3. `project_dependencies.source_file` (SQLite) — package manifest files (pyproject.toml, requirements.txt, package.json, …)
 
 Web URLs (from `web_docs` collection) are excluded from classification since they are not local files.
+
+**Action**: run `project-explorer refresh <slug>` to populate the inventory for projects indexed before this feature was added.
+
+### FileTypeCache — built-in defaults
+
+`FileTypeCache.lookup()` follows a four-level priority chain:
+
+1. Egeria cache by filename (`by_name`) — highest specificity
+2. Egeria cache by extension (`by_ext`)
+3. Built-in defaults by filename (`_BUILTIN_BY_NAME`) — ~20 well-known files (Dockerfile, Makefile, pyproject.toml, requirements.txt, package.json, …)
+4. Built-in defaults by extension (`_BUILTIN_BY_EXTENSION`) — ~55 extensions (.py, .md, .toml, .yaml, .js, .java, .go, .rs, .sh, …)
+
+This means the classifier produces meaningful labels (e.g. "Python Source File", "TOML Configuration", "YAML Configuration") with no Egeria connection. Egeria `ValidMetadataValues` enrich or override the built-ins when credentials are present and the cache is refreshed.
+
+### Unrecognized files — "Other" group
+
+Files whose name and extension match nothing in the priority chain are consolidated into a single **"Other"** `ClassificationAnnotation` rather than creating a separate label per extension. The annotation's `json_properties.unrecognized_extensions` records the extension breakdown (e.g. `{".xyz": 12, ".bin": 3}`). This detail is also stored in `project_file_type_counts.details_json` and surfaced as a hover tooltip on the web File Types chart.
 
 ### FileTypeCache persistence
 
 Survey results are written to `project_file_type_counts` (SQLite) and **appended**, not replaced, on each run. `query_file_type_counts()` returns only the latest run; `query_file_type_history()` returns totals per run for trending. The web File Types chart reads from this table, falling back to raw extension counts from `project_code_symbols` when no survey has been run.
 
-## Next Steps
+The `details_json` column stores per-label breakdown data — currently used to capture the extension breakdown within the "Other" group.
 
-1. Define `SurveyResult` and per-annotation dataclasses in `survey_report.py`
-2. Implement `BaseSurveyor` abstract interface in `base_surveyor.py`
-3. **Wire `file_classifier/` in as the first sub-surveyor** — it's already built, provides immediate value, and validates the architecture and data flow before the others are added. Add the local cache with optional Egeria refresh (per Q3 decision).
-4. Implement remaining sub-surveyors (`file_structure.py`, `health.py` first as they read directly from SQLite; then `language.py`, `dependency.py`, `documentation.py`, `security.py`, `api_structure.py`)
-5. Implement `survey_orchestrator.py`
-6. Implement `EgeriaPublisher` with `SourceControlLibrary` placeholder
-7. Add `project-explorer survey` CLI command
-8. Add Egeria env vars to `.env.example`
+### File count reported by StatsAgent
+
+The file count shown in stats responses now prefers the survey total from `project_file_type_counts` (sum of all type groups, covering all file types). If no survey has been run, it falls back to `COUNT(DISTINCT file_path)` from `project_code_symbols` (code files only) with a note to the user to run a survey for the full count.
+
+## Status — All phases complete
+
+All items from the original Next Steps list have been implemented:
+
+| Phase | Status |
+|---|---|
+| `survey_report.py` — SurveyResult + 7 Annotation dataclasses | ✓ |
+| `base_surveyor.py` — Abstract BaseSurveyor | ✓ |
+| `file_classifier/` — sub-surveyor with FileTypeCache (built-ins + Egeria) | ✓ |
+| 7 sub-surveyors (file_structure, language, health, dependency, documentation, security, api_structure) | ✓ |
+| `survey_orchestrator.py` | ✓ |
+| `egeria_publisher.py` with SourceControlLibrary placeholder | ✓ |
+| `project-explorer survey` CLI command | ✓ |
+| Egeria env vars in `.env.example` | ✓ |
+| `project_file_inventory` table + ingestion pipeline integration | ✓ |
