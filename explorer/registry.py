@@ -36,6 +36,7 @@ class Project:
     subproject_path: str = ""   # relative subdir to index, e.g. "commands" — "" means full repo
     parent_slug: str = ""       # slug of the parent project when this is a sub-project
     extra_docs_paths: list[str] = field(default_factory=list)  # repo-relative paths outside subproject_path to ingest as docs/examples
+    egeria_asset_guid: str = ""  # GUID of the SourceControlLibrary asset in Egeria; "" = not yet published
 
 
 class ProjectRegistry:
@@ -74,7 +75,8 @@ class ProjectRegistry:
                     error_message TEXT DEFAULT '',
                     subproject_path TEXT DEFAULT '',
                     parent_slug TEXT DEFAULT '',
-                    extra_docs_paths TEXT DEFAULT '[]'
+                    extra_docs_paths TEXT DEFAULT '[]',
+                    egeria_asset_guid TEXT DEFAULT NULL
                 )
             """)
             # Migrations: add new columns to existing databases
@@ -84,6 +86,7 @@ class ProjectRegistry:
                 ("subproject_path", "TEXT DEFAULT ''"),
                 ("parent_slug", "TEXT DEFAULT ''"),
                 ("extra_docs_paths", "TEXT DEFAULT '[]'"),
+                ("egeria_asset_guid", "TEXT DEFAULT NULL"),
             ]:
                 if col not in existing:
                     conn.execute(f"ALTER TABLE projects ADD COLUMN {col} {defn}")
@@ -281,6 +284,50 @@ class ProjectRegistry:
                 "CREATE INDEX IF NOT EXISTS idx_file_inventory_slug "
                 "ON project_file_inventory(project_slug)"
             )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS project_egeria_surveys (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_slug       TEXT NOT NULL,
+                    surveyed_at        TEXT NOT NULL,
+                    egeria_report_guid TEXT NOT NULL,
+                    published_at       TEXT NOT NULL,
+                    annotation_count   INTEGER DEFAULT NULL,
+                    UNIQUE(project_slug, surveyed_at),
+                    FOREIGN KEY (project_slug) REFERENCES projects(slug)
+                )
+            """)
+            # Migration: add annotation_count if not present (existing databases)
+            existing_es = {r[1] for r in conn.execute(
+                "PRAGMA table_info(project_egeria_surveys)"
+            ).fetchall()}
+            if "annotation_count" not in existing_es:
+                conn.execute(
+                    "ALTER TABLE project_egeria_surveys ADD COLUMN annotation_count INTEGER DEFAULT NULL"
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_egeria_surveys_slug "
+                "ON project_egeria_surveys(project_slug)"
+            )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS project_data_profiles (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_slug     TEXT NOT NULL,
+                    file_path        TEXT NOT NULL,
+                    profiled_at      TEXT NOT NULL,
+                    format           TEXT NOT NULL,
+                    row_count        INTEGER DEFAULT NULL,
+                    col_count        INTEGER DEFAULT NULL,
+                    schema_json      TEXT DEFAULT NULL,
+                    null_summary     TEXT DEFAULT '',
+                    file_size_bytes  INTEGER DEFAULT 0,
+                    UNIQUE(project_slug, file_path),
+                    FOREIGN KEY (project_slug) REFERENCES projects(slug)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_data_profiles_slug "
+                "ON project_data_profiles(project_slug)"
+            )
 
     def add(self, project: Project) -> None:
         data = {
@@ -296,7 +343,7 @@ class ProjectRegistry:
                     :docs_url, :github_token_encrypted, :collections, :status,
                     :last_indexed_at, :last_stats_fetched_at, :last_commit_sha,
                     :created_at, :error_message, :subproject_path, :parent_slug,
-                    :extra_docs_paths
+                    :extra_docs_paths, :egeria_asset_guid
                 )""",
                 data,
             )
@@ -595,6 +642,143 @@ class ProjectRegistry:
                 (slug,),
             ).fetchall()
         return [r["file_path"] for r in rows]
+
+    def store_data_profiles(self, slug: str, profiles: list[dict]) -> None:
+        """Upsert data-file profiles produced during ingestion.
+
+        Each profile dict must have: file_path, format, row_count (int|None),
+        col_count (int|None), schema_json (str|None), null_summary (str),
+        file_size_bytes (int).
+        """
+        slug = self._normalize_slug(slug)
+        profiled_at = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            conn.executemany(
+                """INSERT INTO project_data_profiles
+                   (project_slug, file_path, profiled_at, format,
+                    row_count, col_count, schema_json, null_summary, file_size_bytes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(project_slug, file_path) DO UPDATE SET
+                     profiled_at=excluded.profiled_at,
+                     format=excluded.format,
+                     row_count=excluded.row_count,
+                     col_count=excluded.col_count,
+                     schema_json=excluded.schema_json,
+                     null_summary=excluded.null_summary,
+                     file_size_bytes=excluded.file_size_bytes""",
+                [
+                    (
+                        slug,
+                        p["file_path"],
+                        profiled_at,
+                        p["format"],
+                        p.get("row_count"),
+                        p.get("col_count"),
+                        p.get("schema_json"),
+                        p.get("null_summary", ""),
+                        p.get("file_size_bytes", 0),
+                    )
+                    for p in profiles
+                ],
+            )
+
+    def get_data_profiles(self, slug: str) -> list[dict]:
+        """Return all stored data-file profiles for a project."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT file_path, format, row_count, col_count,
+                          schema_json, null_summary, file_size_bytes, profiled_at
+                   FROM project_data_profiles WHERE project_slug = ?
+                   ORDER BY file_size_bytes DESC""",
+                (slug,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_file_inventory_with_sizes(self, slug: str) -> list[dict]:
+        """Return file paths and sizes from the inventory for a project.
+
+        Each dict has keys: ``file_path`` (str) and ``file_size_bytes`` (int).
+        """
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT file_path, file_size_bytes FROM project_file_inventory WHERE project_slug = ?",
+                (slug,),
+            ).fetchall()
+        return [{"file_path": r["file_path"], "file_size_bytes": r["file_size_bytes"] or 0} for r in rows]
+
+    # ── Egeria integration ────────────────────────────────────────────────────
+
+    def get_egeria_asset_guid(self, slug: str) -> str | None:
+        """Return the cached Egeria SourceControlLibrary GUID for a project, or None."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT egeria_asset_guid FROM projects WHERE slug = ?", (slug,)
+            ).fetchone()
+        if row:
+            return row["egeria_asset_guid"] or None
+        return None
+
+    def set_egeria_asset_guid(self, slug: str, guid: str) -> None:
+        """Persist the Egeria SourceControlLibrary GUID for a project."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE projects SET egeria_asset_guid = ? WHERE slug = ?",
+                (guid, slug),
+            )
+
+    def record_egeria_survey(
+        self,
+        slug: str,
+        surveyed_at: str,
+        report_guid: str,
+        annotation_count: int | None = None,
+    ) -> None:
+        """Record a published Egeria SurveyReport GUID for a project survey run."""
+        slug = self._normalize_slug(slug)
+        published_at = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO project_egeria_surveys
+                   (project_slug, surveyed_at, egeria_report_guid, published_at, annotation_count)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(project_slug, surveyed_at)
+                   DO UPDATE SET egeria_report_guid = excluded.egeria_report_guid,
+                                 published_at = excluded.published_at,
+                                 annotation_count = excluded.annotation_count""",
+                (slug, surveyed_at, report_guid, published_at, annotation_count),
+            )
+
+    def get_egeria_surveys(self, slug: str) -> list[dict]:
+        """Return all published Egeria survey records for a project, newest first."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT project_slug, surveyed_at, egeria_report_guid, published_at, annotation_count
+                   FROM project_egeria_surveys
+                   WHERE project_slug = ?
+                   ORDER BY surveyed_at DESC""",
+                (slug,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_latest_egeria_survey(self, slug: str) -> dict | None:
+        """Return the most recent published Egeria survey record, or None."""
+        surveys = self.get_egeria_surveys(slug)
+        return surveys[0] if surveys else None
+
+    def get_latest_project_stats(self, slug: str) -> dict | None:
+        """Return the most recent project_stats row as a dict, or None."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM project_stats WHERE project_slug = ? ORDER BY id DESC LIMIT 1",
+                (slug,),
+            ).fetchone()
+        return dict(row) if row else None
 
     # ── dependency graph ──────────────────────────────────────────────────────
 

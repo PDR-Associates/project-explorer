@@ -8,8 +8,10 @@ from explorer.registry import ProjectRegistry
 from explorer.surveyors.file_classifier.file_classifier_surveyor import FileClassifierSurveyor
 from explorer.surveyors.sub_surveyors import (
     ApiStructureSurveyor,
+    DataProfilerSurveyor,
     DependencySurveyor,
     DocumentationSurveyor,
+    FileSizeSurveyor,
     FileStructureSurveyor,
     HealthSurveyor,
     LanguageSurveyor,
@@ -36,10 +38,12 @@ class SurveyOrchestrator:
         registry: ProjectRegistry,
         pyegeria_client=None,
         force_refresh: bool = False,
+        data_path: str | None = None,
     ) -> None:
         self._registry = registry
         self._pyegeria_client = pyegeria_client
         self._force_refresh = force_refresh
+        self._data_path = data_path  # local clone path for DataProfilerSurveyor Tier 2
 
     def run(self, project_slug: str) -> SurveyResult:
         """Survey a single project and return the assembled SurveyResult."""
@@ -62,6 +66,8 @@ class SurveyOrchestrator:
                 force_refresh=self._force_refresh,
             ),
             FileStructureSurveyor(project, self._registry),
+            FileSizeSurveyor(project, self._registry),
+            DataProfilerSurveyor(project, self._registry, local_path=self._data_path),
             LanguageSurveyor(project, self._registry),
             HealthSurveyor(project, self._registry),
             DependencySurveyor(project, self._registry),

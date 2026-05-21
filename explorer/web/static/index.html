@@ -26,11 +26,37 @@
     .prose th, .prose td { border: 1px solid #334155; padding: .3rem .6rem; text-align: left; }
     .prose th { background: #1e293b; }
     .chart-box { height: 300px; margin-bottom: .5rem; }
+    .egeria-panel { max-height: 420px; overflow-y: auto; }
+    .egeria-badge-ok  { background:#064e3b; color:#6ee7b7; }
+    .egeria-badge-no  { background:#1e293b; color:#94a3b8; }
+    .ann-group-header { font-weight:600; font-size:.7rem; text-transform:uppercase; letter-spacing:.05em; color:#f59e0b; margin:.5rem 0 .2rem; }
+    .ann-row { padding:.2rem 0; border-bottom:1px solid #1e293b; font-size:.72rem; color:#cbd5e1; }
+    .ann-rfa  { color:#fbbf24; }
+    .survey-row-detail { background:#0f172a; border-radius:.25rem; padding:.5rem; margin:.25rem 0; display:none; }
+    .survey-row-detail.open { display:block; }
     .project-btn.selected { background: #0e7490 !important; }
     .project-btn.compare-selected { background: #92400e !important; outline: 1px solid #f59e0b; }
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: #0f172a; }
     ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    /* Resizable sidebar */
+    #resize-handle { width:4px; flex-shrink:0; cursor:col-resize; background:#1e293b; transition:background .15s; }
+    #resize-handle:hover, #resize-handle.dragging { background:#0e7490; }
+    /* Main view nav */
+    #main-nav { border-bottom:1px solid #1e293b; background:#0f172a; }
+    .main-nav-btn { padding:.35rem .9rem; font-size:.72rem; font-weight:500; color:#64748b; border-bottom:2px solid transparent; transition:color .15s,border-color .15s; white-space:nowrap; }
+    .main-nav-btn.active { color:#22d3ee; border-bottom-color:#22d3ee; }
+    .main-nav-btn:hover:not(.active) { color:#94a3b8; }
+    /* Survey report */
+    .rpt-section { margin-bottom:1.25rem; }
+    .rpt-section-title { font-size:.65rem; font-weight:600; text-transform:uppercase; letter-spacing:.06em; color:#475569; margin-bottom:.4rem; }
+    .rpt-card { background:#1e293b; border-radius:.375rem; padding:.6rem .75rem; text-align:center; }
+    .rpt-card-val { font-size:1.15rem; font-weight:700; color:#22d3ee; }
+    .rpt-card-lbl { font-size:.65rem; color:#64748b; margin-top:.1rem; }
+    /* Catalog checkboxes */
+    .catalog-cb { accent-color:#06b6d4; cursor:pointer; }
+    .catalog-row { display:flex; align-items:center; gap:.4rem; padding:.15rem 0; font-size:.72rem; color:#94a3b8; cursor:pointer; }
+    .catalog-row:hover { color:#e2e8f0; }
   </style>
 </head>
 <body class="dark bg-slate-900 text-slate-100 h-screen flex flex-col overflow-hidden">
@@ -49,7 +75,7 @@
 <div class="flex flex-1 overflow-hidden">
 
   <!-- Sidebar -->
-  <aside class="w-96 shrink-0 flex flex-col bg-slate-800 border-r border-slate-700 overflow-y-auto">
+  <aside id="sidebar" class="flex flex-col bg-slate-800 border-r border-slate-700 overflow-y-auto" style="width:24rem;min-width:12rem;max-width:50vw">
     <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">Projects</div>
 
     <div class="px-2 pb-1">
@@ -71,13 +97,26 @@
         <button onclick="showChart('languages')" class="chart-tab text-xs px-2 py-0.5 rounded bg-slate-700 hover:bg-cyan-800 text-slate-300">Languages</button>
         <button onclick="showChart('health')"  class="chart-tab text-xs px-2 py-0.5 rounded bg-slate-700 hover:bg-cyan-800 text-slate-300">Health</button>
         <button onclick="showChart('file_types')" class="chart-tab text-xs px-2 py-0.5 rounded bg-slate-700 hover:bg-cyan-800 text-slate-300">File Types</button>
+        <button onclick="showEgeria()" class="chart-tab text-xs px-2 py-0.5 rounded bg-slate-700 hover:bg-cyan-800 text-slate-300">Egeria</button>
       </div>
       <div id="chart-container" class="chart-box rounded bg-slate-900"></div>
+      <div id="egeria-panel" class="egeria-panel hidden"></div>
     </div>
   </aside>
 
+  <div id="resize-handle" title="Drag to resize"></div>
+
   <!-- Chat panel -->
   <main class="flex flex-col flex-1 overflow-hidden">
+
+    <!-- Main view tabs -->
+    <div id="main-nav" class="hidden shrink-0 flex items-center">
+      <button onclick="showMainView('chat')" id="nav-chat" class="main-nav-btn active">💬 Chat</button>
+      <button onclick="showMainView('report')" id="nav-report" class="main-nav-btn">📊 Survey Report</button>
+    </div>
+
+    <!-- Chat view -->
+    <div id="chat-view" class="flex flex-col flex-1 overflow-hidden">
 
     <!-- Messages -->
     <div id="messages" class="flex-1 overflow-y-auto px-4 py-3 space-y-3"></div>
@@ -91,6 +130,11 @@
         <span class="text-xs">Thinking…</span>
       </div>
     </div>
+
+    </div><!-- /chat-view -->
+
+    <!-- Survey report view -->
+    <div id="report-view" class="flex-1 overflow-y-auto hidden p-4 space-y-2"></div>
 
     <!-- Input -->
     <div class="px-4 py-3 border-t border-slate-700 bg-slate-800 shrink-0">
@@ -119,6 +163,7 @@ let lastQueryHash = null;
 let lastAssistantEl = null;
 let pendingClarification = null;   // { query } when agent asked for project
 let currentChart = 'stars';
+let _reportLoaded = false;
 
 // Persistent session ID — survives page reload, gives the server a stable key
 // for the ConversationAgent so memory carries across turns.
@@ -170,7 +215,12 @@ function selectProject(slug) {
     document.getElementById('scope-badge').textContent = slug;
     document.getElementById('scope-badge').classList.remove('hidden');
     document.getElementById('charts-section').classList.remove('hidden');
+    document.getElementById('egeria-panel').classList.add('hidden');
+    document.getElementById('chart-container').classList.remove('hidden');
     showChart(currentChart);
+    document.getElementById('main-nav').classList.remove('hidden');
+    _reportLoaded = false;
+    showMainView('chat');
     if (pendingClarification) {
       const q = pendingClarification;
       pendingClarification = null;
@@ -180,6 +230,7 @@ function selectProject(slug) {
   } else {
     document.getElementById('scope-badge').classList.add('hidden');
     document.getElementById('charts-section').classList.add('hidden');
+    document.getElementById('main-nav').classList.add('hidden');
     document.querySelectorAll('.project-btn[data-slug=""]').forEach(b => b.classList.add('selected'));
   }
 }
@@ -224,8 +275,13 @@ function toggleCompare(slug) {
 async function showChart(type) {
   if (!selectedProject) return;
   currentChart = type;
+  document.getElementById('egeria-panel').classList.add('hidden');
   const container = document.getElementById('chart-container');
+  container.classList.remove('hidden');
   container.innerHTML = '<div class="h-full flex items-center justify-center text-slate-500 text-xs">Loading…</div>';
+  // Highlight active tab
+  document.querySelectorAll('.chart-tab').forEach(b => b.classList.remove('bg-cyan-800','text-white'));
+  event?.target?.classList.add('bg-cyan-800','text-white');
   try {
     const res = await fetch(`/api/stats/${selectedProject}/charts/${type}`);
     if (!res.ok) { container.innerHTML = '<div class="h-full flex items-center justify-center text-slate-500 text-xs">No data — run refresh first</div>'; return; }
@@ -244,6 +300,192 @@ async function showChart(type) {
   } catch (e) {
     container.innerHTML = `<div class="h-full flex items-center justify-center text-red-400 text-xs">${e.message}</div>`;
   }
+}
+
+// ── Egeria tab ─────────────────────────────────────────────────────────────────
+async function showEgeria() {
+  if (!selectedProject) return;
+  document.getElementById('chart-container').classList.add('hidden');
+  const panel = document.getElementById('egeria-panel');
+  panel.classList.remove('hidden');
+  document.querySelectorAll('.chart-tab').forEach(b => b.classList.remove('bg-cyan-800','text-white'));
+  event?.target?.classList.add('bg-cyan-800','text-white');
+  panel.innerHTML = '<div class="text-slate-500 text-xs py-2">Loading Egeria status…</div>';
+  try {
+    const res = await fetch(`/api/egeria/${selectedProject}/status`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    renderEgeriaPanel(panel, data);
+  } catch(e) {
+    panel.innerHTML = `<div class="text-red-400 text-xs py-2">Failed to load: ${e.message}</div>`;
+  }
+}
+
+function renderEgeriaPanel(panel, data) {
+  const registered = data.is_registered;
+  const badgeCls = registered ? 'egeria-badge-ok' : 'egeria-badge-no';
+  const badgeText = registered ? '✓ Registered in Egeria' : '○ Not published';
+  const guidRow = data.asset_guid
+    ? `<div class="text-xs text-slate-400 mt-0.5 font-mono truncate">GUID: ${data.asset_guid}</div>`
+    : '';
+
+  // Survey history table
+  let surveysHtml = '';
+  if (data.surveys && data.surveys.length) {
+    const rows = data.surveys.map((s, i) => {
+      const ts = s.surveyed_at ? s.surveyed_at.replace('T',' ').substring(0,16)+' UTC' : '—';
+      const count = s.annotation_count != null ? s.annotation_count : '—';
+      const guid = s.egeria_report_guid || '—';
+      const isLatest = i === 0;
+      return `<tr class="border-t border-slate-800 text-xs">
+        <td class="py-0.5 pr-2 text-slate-400 whitespace-nowrap">${ts}</td>
+        <td class="py-0.5 pr-2 text-right text-slate-300">${count}</td>
+        <td class="py-0.5 font-mono text-cyan-600 truncate max-w-[7rem]" title="${guid}">${guid.substring(0,8)}…</td>
+        <td class="py-0.5 pl-1">
+          <button onclick="toggleAnnotations(this,'${selectedProject}','${s.surveyed_at}','${guid}')"
+            class="text-xs px-1.5 py-0.5 rounded bg-slate-700 hover:bg-cyan-800 text-slate-300">
+            ${isLatest ? '▶ View' : '▶'}
+          </button>
+        </td>
+      </tr>
+      <tr><td colspan="4" class="p-0">
+        <div class="survey-row-detail" id="detail-${guid.substring(0,8)}"></div>
+      </td></tr>`;
+    }).join('');
+    surveysHtml = `
+      <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider mt-2 mb-1">Survey History</div>
+      <table class="w-full">
+        <thead><tr class="text-xs text-slate-500">
+          <th class="text-left font-normal pb-0.5">Date (UTC)</th>
+          <th class="text-right font-normal pr-2">Ann.</th>
+          <th class="text-left font-normal">Report GUID</th>
+          <th></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  } else {
+    surveysHtml = `<div class="text-slate-500 text-xs mt-2">No surveys published yet.</div>`;
+  }
+
+  panel.innerHTML = `
+    <div class="flex items-center justify-between mb-1">
+      <span class="text-xs px-2 py-0.5 rounded font-medium ${badgeCls}">${badgeText}</span>
+      <button id="publish-btn" onclick="publishSurvey()"
+        class="text-xs px-2 py-0.5 rounded bg-cyan-800 hover:bg-cyan-700 text-white font-medium transition-colors">
+        Publish survey →
+      </button>
+    </div>
+    ${guidRow}
+    <div id="publish-feedback" class="text-xs mt-1"></div>
+    ${surveysHtml}`;
+}
+
+async function publishSurvey() {
+  if (!selectedProject) return;
+  const btn = document.getElementById('publish-btn');
+  const fb  = document.getElementById('publish-feedback');
+  btn.disabled = true;
+  btn.textContent = 'Publishing…';
+  fb.innerHTML = '<span class="text-slate-400">Running survey and publishing to Egeria — this may take up to a minute…</span>';
+  try {
+    const res = await fetch(`/api/egeria/${selectedProject}/publish`, { method: 'POST' });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      fb.innerHTML = `<span class="text-emerald-400">✓ Published — ${data.annotation_count} annotations · Report: <span class="font-mono">${(data.report_guid||'').substring(0,12)}…</span></span>`;
+      // Refresh the panel to show updated survey list
+      setTimeout(() => showEgeria(), 800);
+    } else {
+      const stage = data.stage ? ` (failed at ${data.stage} step)` : '';
+      fb.innerHTML = `<span class="text-amber-400">✗ ${data.error || 'Unknown error'}${stage}</span>`;
+      btn.disabled = false;
+      btn.textContent = 'Retry →';
+    }
+  } catch(e) {
+    fb.innerHTML = `<span class="text-red-400">Request failed: ${e.message}</span>`;
+    btn.disabled = false;
+    btn.textContent = 'Retry →';
+  }
+}
+
+async function toggleAnnotations(btn, slug, surveyedAt, reportGuid) {
+  const key = reportGuid.substring(0,8);
+  const detail = document.getElementById(`detail-${key}`);
+  if (!detail) return;
+  if (detail.classList.contains('open')) {
+    detail.classList.remove('open');
+    btn.textContent = '▶';
+    return;
+  }
+  detail.classList.add('open');
+  btn.textContent = '▼';
+  if (detail.dataset.loaded) return;   // already fetched
+  detail.innerHTML = '<div class="text-slate-500 text-xs">Fetching annotations from Egeria…</div>';
+  try {
+    const params = new URLSearchParams({ surveyed_at: surveyedAt, report_guid: reportGuid });
+    const res = await fetch(`/api/egeria/${slug}/annotations?${params}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      detail.innerHTML = `<div class="text-amber-400 text-xs">${err.detail || 'Egeria not reachable — set EGERIA_PLATFORM_URL in .env'}</div>`;
+      return;
+    }
+    const data = await res.json();
+    detail.innerHTML = renderAnnotations(data.annotations || []);
+    detail.dataset.loaded = '1';
+    // Render quality radar if present
+    const qaDiv = detail.querySelector('.qa-radar');
+    if (qaDiv) renderQualityRadar(qaDiv, JSON.parse(qaDiv.dataset.scores));
+  } catch(e) {
+    detail.innerHTML = `<div class="text-red-400 text-xs">${e.message}</div>`;
+  }
+}
+
+function renderAnnotations(annotations) {
+  if (!annotations.length) return '<div class="text-slate-500 text-xs">No annotations found.</div>';
+  // Group by annotation_type
+  const groups = {};
+  for (const a of annotations) {
+    const t = a.annotation_type || 'Unknown';
+    if (!groups[t]) groups[t] = [];
+    groups[t].push(a);
+  }
+  let html = '';
+  for (const [type, items] of Object.entries(groups).sort()) {
+    html += `<div class="ann-group-header">${type} (${items.length})</div>`;
+    for (const a of items) {
+      const isRfa = type === 'RequestForAction';
+      const conf = a.confidence != null ? ` <span class="text-slate-500">[${a.confidence}]</span>` : '';
+      const rowCls = isRfa ? 'ann-row ann-rfa' : 'ann-row';
+      html += `<div class="${rowCls}">• ${_esc(a.summary)}${conf}`;
+      if (a.explanation) html += `<div class="text-slate-500 pl-3">${_esc(a.explanation)}</div>`;
+      const sub = a.subtype_data || {};
+      if (sub.actionRequested) html += `<div class="text-amber-500 pl-3">→ ${_esc(sub.actionRequested)}</div>`;
+      // Quality scores: embed radar div with data
+      if (type === 'QualityScoreAnnotation' && sub.qualityScores && Object.keys(sub.qualityScores).length) {
+        const encoded = _esc(JSON.stringify(sub.qualityScores));
+        html += `<div class="qa-radar mt-1" style="height:140px" data-scores="${encoded}"></div>`;
+      }
+      html += `</div>`;
+    }
+  }
+  return html;
+}
+
+function renderQualityRadar(el, scores) {
+  const cats = Object.keys(scores);
+  const vals = cats.map(k => scores[k]);
+  Plotly.newPlot(el, [{
+    type: 'scatterpolar', r: [...vals, vals[0]], theta: [...cats, cats[0]],
+    fill: 'toself', fillcolor: 'rgba(6,182,212,0.15)',
+    line: { color: '#06b6d4', width: 1.5 },
+  }], {
+    paper_bgcolor:'#0f172a', plot_bgcolor:'#0f172a',
+    polar: { bgcolor:'#0f172a', radialaxis:{ visible:true, range:[0,100], color:'#475569', gridcolor:'#1e293b', tickfont:{size:7,color:'#64748b'} }, angularaxis:{color:'#475569',gridcolor:'#1e293b'} },
+    font:{ color:'#94a3b8', size:8 }, margin:{ l:30, r:30, t:10, b:10 },
+  }, { displayModeBar:false, responsive:true });
+}
+
+function _esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 // ── chat ───────────────────────────────────────────────────────────────────────
@@ -490,6 +732,257 @@ function feedback() {
   if (!lastAssistantEl || !lastQueryHash) return;
   const fb = lastAssistantEl.querySelector('.mt-1\\.5');
   if (fb) fb.querySelector('button')?.click();
+}
+
+// ── resize ────────────────────────────────────────────────────────────────────
+(function _initResize() {
+  const handle = document.getElementById('resize-handle');
+  const sidebar = document.getElementById('sidebar');
+  if (!handle || !sidebar) return;
+  const stored = localStorage.getItem('pe_sidebar_w');
+  if (stored) sidebar.style.width = stored + 'px';
+  let dragging = false;
+  handle.addEventListener('mousedown', e => {
+    dragging = true;
+    handle.classList.add('dragging');
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const w = Math.max(192, Math.min(e.clientX, window.innerWidth * 0.6));
+    sidebar.style.width = w + 'px';
+  });
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove('dragging');
+    localStorage.setItem('pe_sidebar_w', parseInt(sidebar.style.width));
+  });
+})();
+
+// ── main view tabs ────────────────────────────────────────────────────────────
+function showMainView(tab) {
+  const chatView   = document.getElementById('chat-view');
+  const reportView = document.getElementById('report-view');
+  const navChat    = document.getElementById('nav-chat');
+  const navReport  = document.getElementById('nav-report');
+  if (tab === 'report') {
+    chatView.classList.add('hidden');
+    reportView.classList.remove('hidden');
+    navChat.classList.remove('active');
+    navReport.classList.add('active');
+    if (!_reportLoaded) loadSurveyReport();
+  } else {
+    reportView.classList.add('hidden');
+    chatView.classList.remove('hidden');
+    navChat.classList.add('active');
+    navReport.classList.remove('active');
+  }
+}
+
+// ── survey report view ────────────────────────────────────────────────────────
+async function loadSurveyReport() {
+  if (!selectedProject) return;
+  const view = document.getElementById('report-view');
+  view.innerHTML = '<div class="text-slate-500 text-xs py-8 text-center">Loading survey report…</div>';
+  try {
+    const res = await fetch(`/api/egeria/${selectedProject}/survey-report`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    renderSurveyReport(data);
+    _reportLoaded = true;
+  } catch(e) {
+    view.innerHTML = `<div class="text-red-400 text-xs py-8 text-center">Failed to load: ${e.message}<br><span class="text-slate-500">Run a survey first: <code>project-explorer survey ${selectedProject||'&lt;slug&gt;'}</code></span></div>`;
+  }
+}
+
+function renderSurveyReport(data) {
+  const view = document.getElementById('report-view');
+  const h = data.health || {};
+  const lastSurvey = data.latest_survey;
+  const surveyDate = lastSurvey
+    ? lastSurvey.surveyed_at.replace('T',' ').substring(0,16) + ' UTC'
+    : 'Never';
+
+  let html = `
+    <div class="flex items-start justify-between">
+      <div>
+        <div class="text-base font-bold text-slate-100">${_esc(data.display_name)}</div>
+        <a href="${_esc(data.github_url)}" target="_blank" class="text-xs text-cyan-500 hover:underline">${_esc(data.github_url)}</a>
+      </div>
+      <button onclick="askAboutSurvey()"
+        class="text-xs px-2 py-1 rounded bg-cyan-800 hover:bg-cyan-700 text-white transition-colors whitespace-nowrap ml-3">
+        💬 Ask about this
+      </button>
+    </div>
+    <div class="text-xs text-slate-500">Last surveyed: <span class="text-slate-300">${surveyDate}</span>
+      ${lastSurvey ? `· <span class="text-slate-400">${lastSurvey.annotation_count ?? '?'} annotations</span>` : ''}
+    </div>`;
+
+  // Health cards
+  html += `<div class="rpt-section">
+    <div class="rpt-section-title">Repository Metrics</div>
+    <div class="grid grid-cols-4 gap-2">
+      <div class="rpt-card"><div class="rpt-card-val">${h.stars ?? '—'}</div><div class="rpt-card-lbl">Stars</div></div>
+      <div class="rpt-card"><div class="rpt-card-val">${h.forks ?? '—'}</div><div class="rpt-card-lbl">Forks</div></div>
+      <div class="rpt-card"><div class="rpt-card-val">${h.open_issues ?? '—'}</div><div class="rpt-card-lbl">Open Issues</div></div>
+      <div class="rpt-card"><div class="rpt-card-val">${h.contributors ?? '—'}</div><div class="rpt-card-lbl">Contributors</div></div>
+    </div>
+    <div class="grid grid-cols-3 gap-2 mt-2">
+      <div class="rpt-card"><div class="rpt-card-val text-sm truncate">${_esc(data.primary_language || '—')}</div><div class="rpt-card-lbl">Language</div></div>
+      <div class="rpt-card"><div class="rpt-card-val text-sm truncate">${_esc(h.license || '—')}</div><div class="rpt-card-lbl">License</div></div>
+      <div class="rpt-card"><div class="rpt-card-val">${data.total_files ?? '—'}</div><div class="rpt-card-lbl">Total Files</div></div>
+    </div>
+  </div>`;
+
+  // File types section — chart + catalog checkboxes
+  if (data.file_types && data.file_types.length) {
+    html += `<div class="rpt-section">
+      <div class="rpt-section-title">File Types <span class="text-slate-600 ml-1 normal-case font-normal text-xs">(check rows to catalog in Egeria)</span></div>
+      <div id="rpt-file-chart" style="height:220px" class="rounded bg-slate-900 mb-2"></div>
+      <div class="space-y-0" id="rpt-file-list">`;
+    for (const ft of data.file_types) {
+      const pct = data.total_files > 0 ? Math.round(ft.count / data.total_files * 100) : 0;
+      const extsObj = ft.extensions || {};
+      const extKeys = Object.keys(extsObj).sort((a,b) => extsObj[b]-extsObj[a]).slice(0,5);
+      const extStr  = extKeys.join(', ');
+      const extsJson = JSON.stringify(extKeys).replace(/'/g,"&#39;");
+      html += `<label class="catalog-row">
+        <input type="checkbox" class="catalog-cb"
+          data-label="${_esc(ft.label)}" data-count="${ft.count}" data-exts='${extsJson}'>
+        <span class="flex-1 truncate text-slate-200">${_esc(ft.label)}</span>
+        <span class="text-slate-400 tabular-nums">${ft.count}</span>
+        <span class="text-slate-600 tabular-nums w-10 text-right">${pct}%</span>
+        ${extStr ? `<span class="text-slate-600 text-xs ml-2 truncate max-w-24 hidden sm:inline">${_esc(extStr)}</span>` : ''}
+      </label>`;
+    }
+    html += `</div>
+      <div class="mt-2 flex items-center gap-2">
+        <button onclick="catalogSelected()"
+          class="text-xs px-2.5 py-1 rounded bg-cyan-800 hover:bg-cyan-700 text-white font-medium transition-colors">
+          Catalog selected →
+        </button>
+        <span id="catalog-feedback" class="text-xs text-slate-500"></span>
+      </div>
+    </div>`;
+  }
+
+  // Dependencies section
+  if (data.dependencies && data.dependencies.length) {
+    html += `<div class="rpt-section">
+      <div class="rpt-section-title">Dependencies by Ecosystem</div>
+      <div id="rpt-dep-chart" style="height:${Math.max(140, Math.min(data.dependencies.length, 8) * 28)}px" class="rounded bg-slate-900 mb-2"></div>
+      <div class="grid grid-cols-3 gap-1.5">`;
+    for (const d of data.dependencies.slice(0, 6)) {
+      html += `<div class="rpt-card">
+        <div class="rpt-card-val">${d.count}</div>
+        <div class="rpt-card-lbl">${_esc(d.ecosystem)}</div>
+        <div class="text-xs text-slate-600 mt-0.5">${d.direct} direct</div>
+      </div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  if (h.last_push) {
+    html += `<div class="text-xs text-slate-600">Last push: ${_esc(h.last_push.substring(0,10))}</div>`;
+  }
+
+  view.innerHTML = html;
+
+  // Render file types donut
+  if (data.file_types && data.file_types.length) {
+    const ftEl = document.getElementById('rpt-file-chart');
+    if (ftEl) {
+      const top = data.file_types.slice(0, 14);
+      Plotly.newPlot(ftEl, [{
+        type: 'pie',
+        labels: top.map(f => f.label),
+        values: top.map(f => f.count),
+        hole: 0.42,
+        textinfo: 'label+percent',
+        textfont: { size: 9, color: '#cbd5e1' },
+        marker: { colors: [
+          '#06b6d4','#0891b2','#0e7490','#155e75','#164e63',
+          '#0369a1','#0284c7','#38bdf8','#67e8f9','#a5f3fc',
+          '#22d3ee','#7dd3fc','#bae6fd','#e0f2fe',
+        ]},
+      }], {
+        paper_bgcolor:'#0f172a', plot_bgcolor:'#0f172a',
+        font:{ color:'#94a3b8', size:9 },
+        margin:{ l:10, r:10, t:16, b:10 },
+        showlegend: false,
+        height: 210,
+      }, { displayModeBar:false, responsive:true });
+    }
+  }
+
+  // Render dependencies bar chart
+  if (data.dependencies && data.dependencies.length) {
+    const depEl = document.getElementById('rpt-dep-chart');
+    if (depEl) {
+      const deps = data.dependencies.slice(0, 8);
+      Plotly.newPlot(depEl, [
+        { type:'bar', orientation:'h', name:'Total',
+          x: deps.map(d => d.count), y: deps.map(d => d.ecosystem),
+          marker:{ color:'#0891b2' } },
+        { type:'bar', orientation:'h', name:'Direct',
+          x: deps.map(d => d.direct), y: deps.map(d => d.ecosystem),
+          marker:{ color:'#06b6d4' } },
+      ], {
+        paper_bgcolor:'#0f172a', plot_bgcolor:'#0f172a',
+        barmode: 'overlay',
+        font:{ color:'#94a3b8', size:9 },
+        margin:{ l:80, r:20, t:10, b:20 },
+        xaxis:{ gridcolor:'#1e293b' },
+        yaxis:{ gridcolor:'#1e293b' },
+        legend:{ font:{ size:8, color:'#64748b' }, x:0.7, y:1 },
+        height: depEl.style.height ? parseInt(depEl.style.height) - 10 : 140,
+      }, { displayModeBar:false, responsive:true });
+    }
+  }
+}
+
+function askAboutSurvey() {
+  showMainView('chat');
+  const input = document.getElementById('query-input');
+  input.value = `Summarize the survey results for ${selectedProject}`;
+  input.focus();
+}
+
+async function catalogSelected() {
+  if (!selectedProject) return;
+  const checkboxes = [...document.querySelectorAll('#rpt-file-list .catalog-cb:checked')];
+  const fb = document.getElementById('catalog-feedback');
+  if (!checkboxes.length) {
+    fb.textContent = 'Select at least one file type first.';
+    return;
+  }
+  const elements = checkboxes.map(cb => ({
+    label:      cb.dataset.label,
+    file_count: parseInt(cb.dataset.count) || 0,
+    extensions: (() => { try { return JSON.parse(cb.dataset.exts || '[]'); } catch{ return []; } })(),
+  }));
+  fb.textContent = `Cataloging ${elements.length} element(s)…`;
+  try {
+    const res = await fetch(`/api/egeria/${selectedProject}/catalog-elements`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ elements }),
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      fb.innerHTML = `<span class="text-emerald-400">✓ Cataloged ${data.cataloged.length} element(s) in Egeria</span>`;
+      checkboxes.forEach(cb => { cb.checked = false; });
+    } else {
+      const errs = (data.cataloged || [])
+        .filter(c => c.status === 'error')
+        .map(c => `${c.label}: ${c.error}`)
+        .join('; ');
+      fb.innerHTML = `<span class="text-amber-400">⚠ ${data.status} — ${errs || (data.cataloged[0]?.error || 'unknown error')}</span>`;
+    }
+  } catch(e) {
+    fb.innerHTML = `<span class="text-red-400">Request failed: ${e.message}</span>`;
+  }
 }
 
 // ── utils ──────────────────────────────────────────────────────────────────────

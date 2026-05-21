@@ -198,7 +198,15 @@ def _ingest_web_docs(project, docs_url: str, registry) -> None:
 
 @app.command()
 def refresh(
-    slug: str = typer.Argument(help="Project slug to re-index"),
+    slugs: Optional[list[str]] = typer.Argument(
+        default=None,
+        help="Project slug(s) to re-index. Omit when using --all.",
+    ),
+    all_projects: bool = typer.Option(False, "--all", help="Re-index every registered project"),
+    top_level: bool = typer.Option(
+        False, "--top-level",
+        help="With --all: skip sub-projects (those with a parent_slug set)",
+    ),
     no_stats: bool = typer.Option(False, "--no-stats", help="Skip GitHub statistics update"),
     history: int = typer.Option(
         90, "--history", "-H",
@@ -206,51 +214,73 @@ def refresh(
     ),
     symbols: bool = typer.Option(
         False, "--symbols",
-        help="Extract (or re-extract) code symbols (classes, methods, functions) from source files. "
-             "Use this once after upgrading to populate the symbol index for existing projects.",
+        help="Extract (or re-extract) code symbols from source files.",
     ),
 ):
-    """Incrementally re-index a project and refresh GitHub statistics."""
+    """Incrementally re-index one or more projects and refresh GitHub statistics.
+
+    Examples:
+
+      project-explorer refresh myproject
+      project-explorer refresh proj1 proj2 proj3
+      project-explorer refresh --all
+      project-explorer refresh --all --top-level   # skip sub-projects
+    """
     from explorer.ingestion.incremental import IncrementalIndexer
     from explorer.query_cache import QueryCache
     from explorer.registry import ProjectRegistry
-    project = ProjectRegistry().get(slug)
-    if not project:
-        console.print(f"[red]Project '{slug}' not found.[/red]")
+
+    registry = ProjectRegistry()
+    targets = _resolve_slugs(registry, slugs, all_projects, top_level)
+    if not targets:
         raise typer.Exit(1)
-    indexer = IncrementalIndexer()
-    indexer.refresh(project)
-    dropped = QueryCache().invalidate_project(slug)
-    if dropped:
-        console.print(f"[dim]Cleared {dropped} cached query result(s) for '{slug}'.[/dim]")
-    if symbols:
-        console.print("[dim]Extracting code symbols...[/dim]")
+
+    failed: list[str] = []
+    for project in targets:
+        slug = project.slug
+        label = f"[bold]{project.display_name}[/bold]" + (
+            f" [dim]({slug})[/dim]" if project.display_name != slug else ""
+        )
+        if project.parent_slug:
+            label += f" [dim]← sub-project of {project.parent_slug}[/dim]"
+        console.print(f"\n[cyan]Refreshing {label} …[/cyan]")
         try:
-            from explorer.ingestion.pipeline import IngestionPipeline
-            count = IngestionPipeline().extract_symbols_only(
-                slug, project.github_url, project.collections or []
-            )
-            if count:
-                console.print(f"[green]Extracted {count} symbols.[/green]")
-            else:
-                console.print("[yellow]No code collections found — nothing extracted.[/yellow]")
+            indexer = IncrementalIndexer()
+            indexer.refresh(project)
+            dropped = QueryCache().invalidate_project(slug)
+            if dropped:
+                console.print(f"  [dim]Cleared {dropped} cached query result(s).[/dim]")
+            if symbols:
+                try:
+                    from explorer.ingestion.pipeline import IngestionPipeline
+                    count = IngestionPipeline().extract_symbols_only(
+                        slug, project.github_url, project.collections or []
+                    )
+                    console.print(
+                        f"  [dim]Symbols: {count} extracted.[/dim]" if count
+                        else "  [yellow]No code collections — symbols skipped.[/yellow]"
+                    )
+                except Exception as exc:
+                    console.print(f"  [yellow]Symbol extraction failed: {exc}[/yellow]")
+            if not no_stats:
+                try:
+                    from explorer.github.stats_fetcher import StatsFetcher
+                    result = StatsFetcher().fetch(slug, lookback_days=history)
+                    if "commits_fetch_error" in result:
+                        console.print(
+                            f"  [yellow]Commit history warning:[/yellow] {result['commits_fetch_error']}"
+                        )
+                    else:
+                        n = result.get("commits_fetched", 0)
+                        console.print(f"  [dim]Stats updated ({n} commits, {history}d lookback).[/dim]")
+                except Exception as exc:
+                    console.print(f"  [dim]Stats update skipped: {exc}[/dim]")
+            console.print(f"  [green]✓ Done[/green]")
         except Exception as exc:
-            console.print(f"[yellow]Symbol extraction failed: {exc}[/yellow]")
-    if not no_stats:
-        console.print("[dim]Refreshing project statistics...[/dim]")
-        try:
-            from explorer.github.stats_fetcher import StatsFetcher
-            result = StatsFetcher().fetch(slug, lookback_days=history)
-            if "commits_fetch_error" in result:
-                console.print(
-                    f"[yellow]Warning:[/yellow] commit history could not be fetched: "
-                    f"{result['commits_fetch_error']}"
-                )
-            else:
-                n = result.get("commits_fetched", 0)
-                console.print(f"[dim]Stats updated ({n} commits stored, {history}d lookback).[/dim]")
-        except Exception as exc:
-            console.print(f"[dim]Stats update skipped: {exc}[/dim]")
+            console.print(f"  [red]✗ Failed: {exc}[/red]")
+            failed.append(slug)
+
+    _print_batch_summary(targets, failed, "refreshed")
 
 
 @app.command()
@@ -303,6 +333,97 @@ def serve(
     else:
         console.print(f"[cyan]Starting Project Explorer orchestrator on {host}:{port}[/cyan]")
     agentstack_run(host=host, port=port, all_agents=all_agents)
+
+
+def _resolve_slugs(registry, slugs, all_projects: bool, top_level: bool):
+    """Return the list of Project objects to act on, validating inputs."""
+    from explorer.registry import ProjectRegistry  # already imported at call site, but safe
+    if all_projects:
+        projects = registry.list_all()
+        if top_level:
+            projects = [p for p in projects if not p.parent_slug]
+        if not projects:
+            console.print("[yellow]No projects registered.[/yellow]")
+            return []
+        return projects
+
+    if not slugs:
+        console.print("[red]Provide at least one slug or use --all.[/red]")
+        return []
+
+    result = []
+    for slug in slugs:
+        p = registry.get(slug)
+        if p is None:
+            console.print(f"[red]Project '{slug}' not found — skipping.[/red]")
+        else:
+            result.append(p)
+    if not result:
+        console.print("[red]No valid projects found.[/red]")
+    return result
+
+
+def _print_batch_summary(targets, failed: list[str], verb: str) -> None:
+    """Print a one-liner batch completion summary only when >1 project was processed."""
+    if len(targets) <= 1:
+        return
+    ok = len(targets) - len(failed)
+    color = "green" if not failed else ("yellow" if ok else "red")
+    console.print(
+        f"\n[{color}]{verb.title()}: {ok}/{len(targets)} succeeded"
+        + (f" — failed: {', '.join(failed)}" if failed else "")
+        + f"[/{color}]"
+    )
+
+
+def _print_survey_report(result) -> None:
+    """Print a full single-project survey report to the console."""
+    from explorer.surveyors.survey_report import AnnotationType
+    console.print(f"\n[bold]Survey Report: {result.project_display_name}[/bold]")
+    console.print(f"GitHub: {result.github_url}")
+    if result.project_slug != result.project_display_name:
+        console.print(f"Slug:   {result.project_slug}")
+    console.print(f"Surveyed at: {result.surveyed_at.isoformat()}")
+    console.print(f"Annotations: {len(result.annotations)}  |  Errors: {len(result.errors)}\n")
+
+    for ann_type in AnnotationType:
+        group = result.by_type(ann_type)
+        if not group:
+            continue
+        console.print(f"[bold yellow]{ann_type.value}[/bold yellow] ({len(group)})")
+        for ann in group:
+            console.print(f"  • {ann.summary}")
+            if ann.explanation:
+                console.print(f"    [dim]{ann.explanation}[/dim]")
+        console.print()
+
+    if result.errors:
+        console.print("[bold red]Survey errors:[/bold red]")
+        for err in result.errors:
+            console.print(f"  [red]• {err}[/red]")
+        console.print()
+
+
+def _print_survey_batch_summary(rows: list[dict], published: bool) -> None:
+    """Print a Rich table summarising all projects surveyed in batch mode."""
+    from rich.table import Table
+    tbl = Table(
+        "Project", "Annotations", "Errors",
+        *( ["Report GUID"] if published else [] ),
+        "Status",
+        title="Survey Batch Summary",
+        title_style="bold",
+    )
+    for r in rows:
+        guid_short = (r["report_guid"] or "")[:12] + "…" if r["report_guid"] else "—"
+        status = "[green]✓[/green]" if r["ok"] else "[red]✗[/red]"
+        err_str = str(r["errors"]) if r["errors"] else "[dim]0[/dim]"
+        row = [r["slug"], str(r["annotations"]), err_str]
+        if published:
+            row.append(guid_short)
+        row.append(status)
+        tbl.add_row(*row)
+    console.print(tbl)
 
 
 def _maybe_resolve_alias(query: str) -> Optional[str]:
@@ -384,91 +505,252 @@ def aliases_remove(
 
 @app.command()
 def survey(
-    slug: str = typer.Argument(help="Project slug to survey"),
+    slugs: Optional[list[str]] = typer.Argument(
+        default=None,
+        help="Project slug(s) to survey. Omit when using --all.",
+    ),
+    all_projects: bool = typer.Option(False, "--all", help="Survey every registered project"),
+    top_level: bool = typer.Option(
+        False, "--top-level",
+        help="With --all: skip sub-projects (those with a parent_slug set)",
+    ),
     publish: bool = typer.Option(False, "--publish", help="Push the survey report to Egeria"),
     refresh_cache: bool = typer.Option(False, "--refresh", help="Force-refresh the file type cache from Egeria before surveying"),
     platform_url: Optional[str] = typer.Option(None, "--egeria-url", help="Egeria platform URL (overrides EGERIA_PLATFORM_URL env var)"),
     view_server: Optional[str] = typer.Option(None, "--egeria-server", help="Egeria view server name (overrides EGERIA_VIEW_SERVER)"),
+    data_path: Optional[str] = typer.Option(None, "--data-path", help="Path to a local clone for CSV/Parquet column-level profiling"),
 ):
-    """Survey a project and produce an Egeria-aligned annotation report.
+    """Survey one or more projects and produce Egeria-aligned annotation reports.
 
     Without --publish: prints the survey as a markdown report (no Egeria required).
+    With --publish: also pushes to Egeria.  Sub-projects that share a GitHub URL
+    with their parent will share the same SourceControlLibrary asset in Egeria.
 
-    With --publish: also pushes the SurveyReport and all Annotations to Egeria,
-    then offers to trigger a governance action process to catalog the asset.
+    Examples:
+
+      project-explorer survey myproject
+      project-explorer survey proj1 proj2 proj3
+      project-explorer survey --all
+      project-explorer survey --all --top-level     # skip sub-projects
+      project-explorer survey --all --publish       # survey + publish all
     """
     from explorer.registry import ProjectRegistry
     from explorer.surveyors.survey_orchestrator import SurveyOrchestrator
     from explorer.surveyors.survey_report import AnnotationType
 
     registry = ProjectRegistry()
-    project = registry.get(slug)
-    if project is None:
-        console.print(f"[red]Project '{slug}' not found. Run 'project-explorer list' to see registered projects.[/red]")
+    targets = _resolve_slugs(registry, slugs, all_projects, top_level)
+    if not targets:
         raise typer.Exit(1)
 
-    console.print(f"[cyan]Surveying [bold]{project.display_name}[/bold] …[/cyan]")
+    batch = len(targets) > 1
 
-    # Optional: connect to Egeria for cache refresh even without --publish
+    # Build Egeria client once (if needed) and reuse across projects
     pyegeria_client = None
     if refresh_cache or publish:
         pyegeria_client = _try_build_egeria_client(platform_url, view_server)
 
-    orchestrator = SurveyOrchestrator(
-        registry=registry,
-        pyegeria_client=pyegeria_client,
-        force_refresh=refresh_cache,
-    )
-    result = orchestrator.run(slug)
-
-    # ── Markdown report ───────────────────────────────────────────────────────
-    console.print(f"\n[bold]Survey Report: {result.project_display_name}[/bold]")
-    console.print(f"GitHub: {result.github_url}")
-    console.print(f"Surveyed at: {result.surveyed_at.isoformat()}")
-    console.print(f"Annotations: {len(result.annotations)}  |  Errors: {len(result.errors)}\n")
-
-    for ann_type in AnnotationType:
-        group = result.by_type(ann_type)
-        if not group:
-            continue
-        console.print(f"[bold yellow]{ann_type.value}[/bold yellow] ({len(group)})")
-        for ann in group:
-            console.print(f"  • {ann.summary}")
-            if ann.explanation:
-                console.print(f"    [dim]{ann.explanation}[/dim]")
-        console.print()
-
-    if result.errors:
-        console.print("[bold red]Survey errors:[/bold red]")
-        for err in result.errors:
-            console.print(f"  [red]• {err}[/red]")
-        console.print()
-
-    # ── Egeria publish ────────────────────────────────────────────────────────
+    publisher = None
     if publish:
         from explorer.surveyors.egeria_publisher import EgeriaConnectionError, EgeriaPublisher
         try:
             publisher = EgeriaPublisher(
                 platform_url=platform_url,
                 view_server=view_server,
+                registry=registry,
             )
-            console.print("[cyan]Publishing to Egeria …[/cyan]")
-            report_guid = publisher.publish(result)
-            console.print(f"[green]SurveyReport created: GUID {report_guid}[/green]")
-
-            # Governance action prompt (kept deliberate and opt-in)
-            catalog = typer.confirm(
-                "\nTrigger governance action process to catalog this asset in Egeria?",
-                default=False,
-            )
-            if catalog:
-                console.print(
-                    "[yellow]Governance action integration is not yet implemented — "
-                    "watch for this in a future release.[/yellow]"
-                )
         except EgeriaConnectionError as exc:
             console.print(f"[red]Egeria connection failed: {exc}[/red]")
             raise typer.Exit(1)
+
+    orchestrator = SurveyOrchestrator(
+        registry=registry,
+        pyegeria_client=pyegeria_client,
+        force_refresh=refresh_cache,
+        data_path=data_path,
+    )
+
+    failed: list[str] = []
+    survey_rows: list[dict] = []   # for batch summary table
+
+    for project in targets:
+        slug = project.slug
+        label = f"[bold]{project.display_name}[/bold]"
+        if project.parent_slug:
+            label += f" [dim](sub-project of {project.parent_slug}, path: {project.subproject_path or '/'})[/dim]"
+        console.print(f"\n[cyan]Surveying {label} …[/cyan]")
+
+        try:
+            result = orchestrator.run(slug)
+        except Exception as exc:
+            console.print(f"  [red]✗ Survey failed: {exc}[/red]")
+            failed.append(slug)
+            survey_rows.append({"slug": slug, "annotations": 0, "errors": 1, "report_guid": None, "ok": False})
+            continue
+
+        # ── Per-project report (condensed in batch mode) ──────────────────
+        if not batch:
+            _print_survey_report(result)
+        else:
+            ann_counts = {t.value: len(result.by_type(t)) for t in AnnotationType if result.by_type(t)}
+            summary = ", ".join(f"{v} {k}" for k, v in ann_counts.items())
+            status_str = f"[green]✓[/green]" if not result.errors else f"[yellow]⚠ {len(result.errors)} error(s)[/yellow]"
+            console.print(f"  {status_str} {len(result.annotations)} annotations — {summary}")
+            if result.errors:
+                for err in result.errors[:3]:
+                    console.print(f"    [dim red]{err}[/dim red]")
+
+        # ── Egeria publish ────────────────────────────────────────────────
+        report_guid = None
+        if publisher:
+            try:
+                console.print(f"  [dim]Publishing to Egeria…[/dim]")
+                report_guid = publisher.publish(result)
+                console.print(f"  [green]SurveyReport GUID: {report_guid}[/green]")
+            except Exception as exc:
+                console.print(f"  [red]Egeria publish failed: {exc}[/red]")
+                if not batch:
+                    raise typer.Exit(1)
+                failed.append(f"{slug}(publish)")
+
+        survey_rows.append({
+            "slug": slug,
+            "annotations": len(result.annotations),
+            "errors": len(result.errors),
+            "report_guid": report_guid,
+            "ok": slug not in failed,
+        })
+
+    if batch:
+        _print_survey_batch_summary(survey_rows, publish)
+    elif not failed and publish and not batch:
+        # Single-project governance action prompt (batch skips this)
+        catalog = typer.confirm(
+            "\nTrigger governance action process to catalog this asset in Egeria?",
+            default=False,
+        )
+        if catalog:
+            console.print(
+                "[yellow]Governance action integration is not yet implemented — "
+                "watch for this in a future release.[/yellow]"
+            )
+
+    _print_batch_summary(targets, failed, "surveyed")
+
+
+@app.command(name="egeria-reports")
+def egeria_reports(
+    slug: str = typer.Argument(help="Project slug"),
+    full: bool = typer.Option(False, "--full", help="Show all annotations for the latest survey"),
+    platform_url: Optional[str] = typer.Option(None, "--egeria-url", help="Egeria platform URL (overrides EGERIA_PLATFORM_URL env var)"),
+    view_server: Optional[str] = typer.Option(None, "--egeria-server", help="Egeria view server name (overrides EGERIA_VIEW_SERVER)"),
+):
+    """Show Egeria survey reports published for a project.
+
+    Reads from the local registry by default (no Egeria connection needed).
+    Use --full to fetch and display all annotations from Egeria for the latest survey.
+    """
+    from explorer.registry import ProjectRegistry
+    from explorer.surveyors.egeria_reader import EgeriaReader, EgeriaReaderError
+
+    registry = ProjectRegistry()
+    project = registry.get(slug)
+    if project is None:
+        console.print(f"[red]Project '{slug}' not found.[/red]")
+        raise typer.Exit(1)
+
+    reader = EgeriaReader(
+        platform_url=platform_url,
+        view_server=view_server,
+        registry=registry,
+    )
+
+    # ── Asset registration status ─────────────────────────────────────────────
+    asset_guid = registry.get_egeria_asset_guid(slug)
+    console.print(f"\n[bold]Egeria surveys for {project.display_name}[/bold]")
+    if asset_guid:
+        console.print(f"Asset GUID : [cyan]{asset_guid}[/cyan]  (SourceControlLibrary)")
+    else:
+        console.print("Asset GUID : [dim]not registered[/dim]")
+    console.print(f"Platform   : {reader.platform_url}\n")
+
+    # ── Survey history (from local registry) ──────────────────────────────────
+    surveys = reader.get_survey_reports_from_registry(slug)
+
+    if not surveys:
+        console.print("[yellow]No surveys published to Egeria yet for this project.[/yellow]")
+        console.print("Run [bold]project-explorer survey " + slug + " --publish[/bold] to publish one.")
+        raise typer.Exit(0)
+
+    # Build table
+    from rich.table import Table
+    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Surveyed at", min_width=22)
+    table.add_column("Annotations", justify="right", min_width=11)
+    table.add_column("Egeria Report GUID")
+
+    for i, row in enumerate(surveys, start=1):
+        suffix = "  ← latest" if i == 1 else ""
+        count = str(row.get("annotation_count") or "—")
+        table.add_row(
+            str(i),
+            row.get("surveyed_at", "—"),
+            count,
+            f"[cyan]{row.get('egeria_report_guid', '—')}[/cyan]{suffix}",
+        )
+
+    console.print(table)
+
+    if not full:
+        console.print("\nRun with [bold]--full[/bold] to display all annotations for the latest survey.")
+        raise typer.Exit(0)
+
+    # ── Full annotation display for the latest survey ─────────────────────────
+    latest = surveys[0]
+    report_guid = latest.get("egeria_report_guid", "")
+    surveyed_at = latest.get("surveyed_at", "")
+
+    console.print(f"\n[bold]Annotations for survey: {surveyed_at}[/bold]")
+    console.print(f"Report GUID: [cyan]{report_guid}[/cyan]\n")
+
+    try:
+        annotations = reader.get_annotations(slug, surveyed_at)
+    except EgeriaReaderError as exc:
+        console.print(f"[red]Could not connect to Egeria: {exc}[/red]")
+        console.print("[dim]Hint: set EGERIA_PLATFORM_URL in .env to enable full annotation display.[/dim]")
+        raise typer.Exit(1)
+
+    if not annotations:
+        console.print("[yellow]No annotations found in Egeria for this survey.[/yellow]")
+        raise typer.Exit(0)
+
+    # Group by annotation_type
+    from collections import defaultdict
+    groups: dict[str, list] = defaultdict(list)
+    for ann in annotations:
+        groups[ann.get("annotation_type", "Unknown")].append(ann)
+
+    for ann_type, group in sorted(groups.items()):
+        console.print(f"[bold yellow]{ann_type}[/bold yellow] ({len(group)})")
+        for ann in group:
+            summary = ann.get("summary", "")
+            confidence = ann.get("confidence")
+            line = f"  • {summary}"
+            if confidence is not None:
+                line += f"  [dim][confidence: {confidence}][/dim]"
+            console.print(line)
+            explanation = ann.get("explanation", "")
+            if explanation:
+                console.print(f"    [dim]{explanation}[/dim]")
+            # Show key subtype fields inline
+            sub = ann.get("subtype_data", {})
+            if sub.get("actionRequested"):
+                console.print(f"    [yellow]Action: {sub['actionRequested']}[/yellow]")
+            if sub.get("qualityScores"):
+                scores = "  ".join(f"{k}={v}" for k, v in sub["qualityScores"].items())
+                console.print(f"    [dim]Scores: {scores}[/dim]")
+        console.print()
 
 
 def _try_build_egeria_client(platform_url: Optional[str], view_server: Optional[str]):

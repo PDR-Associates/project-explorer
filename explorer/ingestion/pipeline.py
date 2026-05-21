@@ -135,6 +135,7 @@ class IngestionPipeline:
         file_count, loc = self._count_repo_stats(code_root)
         self._store_file_inventory(project_slug, code_root)
         self._parse_dependencies(project_slug, code_root)
+        self._profile_data_files(project_slug, code_root)
         return file_count, loc
 
     def _ingest_collection(
@@ -290,6 +291,76 @@ class IngestionPipeline:
             )
         except Exception as exc:
             self.console.print(f"[dim]File inventory skipped: {exc}[/dim]")
+
+    def _profile_data_files(self, project_slug: str, local_root: Path) -> None:
+        """Profile CSV/XLSX/Parquet files while the repo is still on disk.
+
+        Results are stored in project_data_profiles so DataProfilerSurveyor can
+        emit column-level schema annotations without needing a local clone at
+        survey time.  Skips files larger than 50 MB and silently degrades if
+        pandas or optional readers are not installed.
+        """
+        from explorer.surveyors.sub_surveyors.data_profiler import (
+            _DATA_EXTENSIONS,
+            _MAX_PROFILE_SIZE_MB,
+            _PANDAS_READABLE,
+            DataProfilerSurveyor,
+        )
+
+        try:
+            import pandas as pd
+        except ImportError:
+            self.console.print("[dim]Data profiling skipped (pandas not installed).[/dim]")
+            return
+
+        profiles: list[dict] = []
+        limit_bytes = _MAX_PROFILE_SIZE_MB * 1_048_576
+
+        for p in local_root.rglob("*"):
+            if not p.is_file():
+                continue
+            ext = p.suffix.lstrip(".").lower()
+            if ext not in _DATA_EXTENSIONS:
+                continue
+            try:
+                size = p.stat().st_size
+            except Exception:
+                size = 0
+
+            fmt = _DATA_EXTENSIONS[ext]
+            profile: dict = {
+                "file_path": str(p.relative_to(local_root)),
+                "format": fmt,
+                "file_size_bytes": size,
+            }
+
+            if ext in _PANDAS_READABLE and size <= limit_bytes and size > 0:
+                try:
+                    result = DataProfilerSurveyor._profile_file(p, ext, pd)
+                    if result:
+                        import json
+                        profile.update({
+                            "row_count": result["row_count"],
+                            "col_count": result["col_count"],
+                            "schema_json": json.dumps(result["columns"]),
+                            "null_summary": result.get("null_summary", ""),
+                        })
+                except Exception as exc:
+                    self.console.print(f"[dim]Profile skipped for {p.name}: {exc}[/dim]")
+
+            profiles.append(profile)
+
+        if profiles:
+            try:
+                self.registry.store_data_profiles(project_slug, profiles)
+                readable = sum(1 for p in profiles if p.get("row_count") is not None)
+                self.console.print(
+                    f"[dim]Data profiles: {len(profiles)} data file(s) found"
+                    + (f", {readable} profiled (row/column schema)." if readable else ".")
+                    + "[/dim]"
+                )
+            except Exception as exc:
+                self.console.print(f"[dim]Data profiles skipped: {exc}[/dim]")
 
     def _local_files(self, local_root: Path, extensions: list[str]) -> list[tuple[str, str]]:
         """Walk the extracted repo and return (relative_path, content) for matching files."""
