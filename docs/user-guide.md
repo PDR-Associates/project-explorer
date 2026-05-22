@@ -119,12 +119,17 @@ project-explorer web --reload   # auto-reload on code changes (dev)
 ```
 
 The web UI provides:
-- **Project sidebar** — click any project to scope all queries to it; status badges show active/indexing/error
+- **Project sidebar** — click any project to scope all queries to it; status badges show active/indexing/error. Hover over a project row to reveal three action buttons:
+  - **🔄 Refresh & profile** — re-indexes the repo and populates data profiles; runs synchronously and returns ✓ or ✗ when done; auto-reloads the Survey Report tab if it was open
+  - **📊 Survey** — runs the survey pipeline, switches to the Survey Report tab, and reloads it
+  - **↗** — opens the project's GitHub URL in a new tab
+  - Tooltips appear immediately on hover (CSS-based, no browser delay)
 - **Multi-project comparison** — Shift+click a second (or third) project to enter compare mode; the scope badge updates to show all selected projects and queries are automatically prefixed to trigger `CompareAgent` or `IntegrationAgent`
 - **Streaming responses** — assistant text appears token-by-token via server-sent events (SSE); no waiting for the full answer
 - **Conversation memory** — a UUID session ID is stored in `localStorage` and sent with every request; the server maintains a persistent `ConversationAgent` per session (30-minute idle timeout), giving the web UI the same cross-turn memory as the TUI and CLI
 - **Inline charts** — when a statistical or health query warrants a chart, a Plotly figure appears directly in the chat response alongside the text
 - **Inline symbol tables** — when a code inventory query ("how many classes?", "list all functions") is answered, a sortable table of symbols appears below the response; sortable by name, kind, or file
+- **Survey Report tab** — click "📊 Survey Report" in the top nav when a project is selected. Shows health metric cards, a file type donut chart, a dependency bar chart, and a **Data Files** section with column schemas, row counts, and null rates for profiled CSV/Excel/Parquet files. When data files are detected but no profiles exist yet, a hint appears with the exact `refresh` command to run. Select file type rows and click **"Catalog selected →"** to create Egeria `DataSet` assets.
 - **Sidebar charts** — Plotly interactive charts (Stars, Commits, Languages, Health) per selected project; click chart tabs to switch. The Commits tab shows the last 13 weeks of actual commit activity from the `project_commits` table, not snapshot aggregates
 - **👍/👎 feedback buttons** — on each assistant message; keyboard `f` key also opens feedback
 - **Alias suggestions** — when the agent finds a fuzzy match for an unrecognized project name, a banner appears with Yes/No confirmation; confirmed aliases are stored and resolve automatically
@@ -171,12 +176,26 @@ curl -X POST http://localhost:8000/api/query/feedback \
 # List projects
 curl http://localhost:8000/api/projects/
 
+# Refresh and profile a project (synchronous — returns when done)
+curl -X POST http://localhost:8000/api/projects/ml-llm-ops/refresh
+# Returns: {"status": "ok", "slug": "ml-llm-ops", "message": "..."}
+
 # Get a chart (returns Plotly JSON)
 curl http://localhost:8000/api/stats/ml-llm-ops/charts/stars
 curl http://localhost:8000/api/stats/ml-llm-ops/charts/commits
 curl http://localhost:8000/api/stats/ml-llm-ops/charts/weekly_commits
 curl http://localhost:8000/api/stats/ml-llm-ops/charts/languages
 curl http://localhost:8000/api/stats/ml-llm-ops/charts/health
+
+# Survey a project (no publish — returns annotation count and timestamp)
+curl -X POST http://localhost:8000/api/egeria/ml-llm-ops/survey
+# Returns: {"status": "ok", "annotation_count": 18, "surveyed_at": "2026-05-22T..."}
+
+# Get survey report from SQLite (no Egeria needed)
+curl http://localhost:8000/api/egeria/ml-llm-ops/survey-report
+
+# Egeria registration status
+curl http://localhost:8000/api/egeria/ml-llm-ops/status
 ```
 
 ---
@@ -258,10 +277,12 @@ project-explorer remove ml-llm-ops
 
 `refresh` does three things:
 1. Compares the latest commit SHA against the last-indexed SHA. Only files changed in the diff are re-indexed, one collection at a time. Typically completes in under a minute for small changes.
-2. Fetches updated GitHub statistics and the latest 90 days of commit history into SQLite.
-3. If `--symbols` is passed: downloads the repo and re-extracts all code symbols (classes, methods, functions, interfaces) into the `project_code_symbols` table, without touching Milvus.
+2. Always re-runs file inventory (`project_file_inventory`) and data profiling (`project_data_profiles`) when the repo is downloaded — so profiles are kept current whenever collections are re-indexed.
+3. Fetches updated GitHub statistics and the latest 90 days of commit history into SQLite.
 
-Use `--no-stats` to skip step 2 (e.g., if you've hit a GitHub rate limit).
+**If no commits are detected but `project_data_profiles` is empty**, refresh automatically downloads the repo just to run profiling — so a plain `project-explorer refresh <slug>` is always enough to populate profiles, even if the code hasn't changed. This covers projects that were indexed before data profiling was added.
+
+Use `--no-stats` to skip the GitHub statistics step (e.g., if you've hit a rate limit).
 
 ### Code Symbol Index
 
@@ -303,6 +324,116 @@ project-explorer add-docs myproject --homepage https://myproject.io
 ```
 
 Fetches the docs URL via Docling and stores chunks in the `web_docs` collection.
+
+---
+
+## Surveying Projects
+
+`project-explorer survey` produces an **Egeria-aligned annotation report** for any indexed
+project. It reads entirely from SQLite — no local clone, no Egeria connection needed. Publishing
+to Egeria is optional.
+
+```bash
+# Survey one project
+project-explorer survey egeria
+
+# Survey several at once
+project-explorer survey egeria beeai_framework ml_llm_ops
+
+# Survey all registered projects
+project-explorer survey --all
+
+# Survey and publish to Egeria in one step
+project-explorer survey egeria --publish
+```
+
+### What the survey covers
+
+| Section | What it tells you |
+|---|---|
+| **File Classification** | Every file type in the repo (Python, Markdown, YAML, CSV, Parquet, …) with counts |
+| **File Structure** | Total file count, repo size, lines of code, per-directory breakdown |
+| **File Size** | Disk footprint by type, top-10 largest files; flags files >50 MB for Git LFS |
+| **Data Profiling** | Counts and sizes per data format; column schemas for CSV, Excel, Parquet, Arrow |
+| **Language** | Primary and secondary languages, inferred project type (Library / CLI / Service) |
+| **Health** | Activity, community, release cadence, and freshness scores (0–100) |
+| **Dependencies** | All dependencies grouped by ecosystem (PyPI, npm, Maven, …) |
+| **Documentation** | Which collection types are indexed, which hygiene files exist |
+| **Security** | Flags for missing SECURITY.md, no CI configuration, no license |
+| **API Structure** | Public classes, functions, and module tree per language |
+
+### Data profiling
+
+Profiling runs automatically during `add` and `refresh` while the repo is on disk. When you
+run `survey` later, the stored profiles are read from SQLite — no re-download needed.
+
+```
+project-explorer survey house_prices_global
+```
+
+Example data profiling output:
+
+```
+DataProfiling (4)
+  • 6 data file(s) across 1 format(s), total 18.3 MB
+
+  • train.csv: 1,460 rows × 81 columns  [CSV]
+    5 column(s) >50% null: PoolQC, MiscFeature, Alley, Fence, FireplaceQu
+    Columns: Id (int64), MSSubClass (int64), MSZoning (object), LotFrontage (float64), ... +77 more
+
+  • test.csv: 1,459 rows × 80 columns  [CSV]
+
+  • ⚠ large_backup.csv (62 MB) — exceeds 50 MB profiling limit for text formats
+    Run: project-explorer survey house_prices_global --data-path ~/repos/house-prices
+```
+
+**If you see "No file inventory found — run refresh"**, the project was indexed before the file
+inventory feature was added. Fix it with:
+
+```bash
+project-explorer refresh <slug>
+```
+
+Profiling supports CSV, Excel, Parquet, and Arrow/Feather. Parquet and Arrow files are profiled
+from metadata only — no size limit. CSV and Excel are skipped above 50 MB. See
+[docs/surveyor-reference.md](surveyor-reference.md) for the full format table.
+
+### Viewing results
+
+**CLI** — `survey` prints the full annotation report to the terminal.
+
+**Web UI** — select a project and click **"📊 Survey Report"** in the top nav. Shows health
+metric cards, a file type donut chart, dependency bar chart, and a **Data Files** section with
+column schemas, row counts, and null rates. If data files are detected but no profiles exist, a
+hint displays the `refresh` command. Select file type rows and click **"Catalog selected →"** to
+create `DataSet` assets in Egeria. You can also trigger refresh or survey directly from the
+sidebar hover buttons (🔄 and 📊).
+
+**Chat** — ask naturally:
+
+```
+project-explorer ask --project house_prices_global "What data files are in this project?"
+project-explorer ask --project house_prices_global "How many rows does train.csv have?"
+project-explorer ask --project house_prices_global "Which columns have high null rates?"
+```
+
+### Publishing to Egeria
+
+`--publish` runs the survey and pushes all annotations to Egeria as a linked `SurveyReport`:
+
+```bash
+project-explorer survey egeria --publish
+```
+
+The project's Egeria asset GUID is cached locally after the first publish, so subsequent runs
+skip the discovery search. Each survey run creates a new `SurveyReport` — history is preserved.
+
+View published survey history (no Egeria connection needed):
+
+```bash
+project-explorer egeria-reports egeria
+project-explorer egeria-reports egeria --full   # fetch full annotation detail from Egeria
+```
 
 ---
 
@@ -492,6 +623,12 @@ Add a GitHub token to `.env` and re-run. Authenticated requests have a 5000/hour
 
 **Web UI charts show "No data — run refresh first"**
 The chart endpoint needs stats in SQLite. Run `project-explorer refresh <slug>` to populate them.
+
+**Survey Report tab shows "Data file inventory detected but no column profiles yet"**
+The project was indexed before data profiling was added. Run `project-explorer refresh <slug>` — it will detect empty profiles and download + profile automatically, even if no new commits exist.
+
+**"Catalog selected →" returns a VALIDATION_ERROR or "Invalid URL"**
+Egeria must be running and reachable at `EGERIA_PLATFORM_URL`. Verify the platform URL is set correctly and the server is up, then try again. The project must also have been published to Egeria first (run `project-explorer survey <slug> --publish`).
 
 **Web UI commit chart appears flat or shows only a single bar**
 The Commits chart reads from the `project_commits` table (per-commit history, last 13 weeks). If the table is empty, all bars are zero. Run `project-explorer refresh <slug>` to fetch commit history. With only one week of data the chart will still display correctly because the y-axis always starts from zero.

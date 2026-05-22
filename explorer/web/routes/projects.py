@@ -1,7 +1,9 @@
 """Project management endpoints — list, get, remove, refresh."""
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+import asyncio
+
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -46,22 +48,44 @@ async def get_project(slug: str) -> ProjectSummary:
     return _to_summary(project)
 
 
-@router.post("/{slug}/refresh")
-async def refresh_project(slug: str, background_tasks: BackgroundTasks) -> dict:
-    """Trigger an incremental re-index in the background."""
+class RefreshResult(BaseModel):
+    status: str          # "ok" | "error"
+    slug: str
+    message: str = ""
+    error: str | None = None
+
+
+@router.post("/{slug}/refresh", response_model=RefreshResult)
+async def refresh_project(slug: str) -> RefreshResult:
+    """Incremental re-index + data profiling, runs synchronously in a thread."""
     from explorer.registry import ProjectRegistry
     project = ProjectRegistry().get(slug)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
 
-    def _do_refresh():
-        from explorer.ingestion.incremental import IncrementalIndexer
-        from explorer.query_cache import QueryCache
-        IncrementalIndexer().refresh(project)
-        QueryCache().invalidate_project(slug)
+    output_lines: list[str] = []
 
-    background_tasks.add_task(_do_refresh)
-    return {"status": "refresh_started", "slug": slug}
+    def _do_refresh():
+        import io, sys
+        buf = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            from explorer.ingestion.incremental import IncrementalIndexer
+            from explorer.query_cache import QueryCache
+            IncrementalIndexer().refresh(project)
+            QueryCache().invalidate_project(slug)
+        finally:
+            sys.stdout = old_stdout
+            output_lines.extend(buf.getvalue().splitlines())
+
+    try:
+        await asyncio.to_thread(_do_refresh)
+    except Exception as exc:
+        return RefreshResult(status="error", slug=slug, error=str(exc))
+
+    msg = "; ".join(output_lines) if output_lines else "Done"
+    return RefreshResult(status="ok", slug=slug, message=msg)
 
 
 @router.delete("/{slug}")

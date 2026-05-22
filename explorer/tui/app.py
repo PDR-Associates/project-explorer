@@ -50,28 +50,25 @@ class ChatMessage(Static):
     def __init__(self, role: str, text: str = "") -> None:
         self._role = role
         self._color = "cyan" if role == "You" else "green"
-        super().__init__(self._render(text))
+        super().__init__(self._format(text))
         self.add_class(f"msg-{role.lower()}")
 
-    def _render(self, text: str) -> str:
+    def _format(self, text: str) -> str:
         return f"[bold {self._color}]{self._role}:[/bold {self._color}]\n{text}"
 
     def append_text(self, text: str) -> None:
         """Append a chunk to the existing content (called from worker thread via call_from_thread)."""
-        current = self.renderable
-        # Strip the existing markup header to get raw text, then re-render with appended text
-        # Simpler: track raw text separately
         if not hasattr(self, "_raw"):
             self._raw = ""
         self._raw += text
-        self.update(self._render(self._raw))
+        self.update(self._format(self._raw))
 
     def set_text(self, text: str) -> None:
         """Replace the full text content."""
         if not hasattr(self, "_raw"):
             self._raw = ""
         self._raw = text
-        self.update(self._render(text))
+        self.update(self._format(text))
 
 
 class ProjectExplorerApp(App):
@@ -264,7 +261,7 @@ class ProjectExplorerApp(App):
         log = self.query_one("#chat-log")
         bubble = ChatMessage("Assistant")
         self.call_from_thread(log.mount, bubble)
-        self.call_from_thread(log.scroll_end, False)
+        self.call_from_thread(log.scroll_end, animate=False)
 
         accumulated = ""
         try:
@@ -274,7 +271,7 @@ class ProjectExplorerApp(App):
                 chunk = str(item)
                 accumulated += chunk
                 self.call_from_thread(bubble.append_text, chunk)
-                self.call_from_thread(log.scroll_end, False)
+                self.call_from_thread(log.scroll_end, animate=False)
         except Exception as exc:
             accumulated = f"Error: {exc}"
             self.call_from_thread(bubble.set_text, accumulated)
@@ -379,28 +376,33 @@ def run() -> None:
     those libraries initialise inside a worker thread.
     """
     import sys
+    from rich.console import Console
+    from rich.status import Status
     from explorer.rag_system import RAGSystem
     from explorer.agents.conversation_agent import ConversationAgent
 
-    # Pre-warm embedding model in the main thread — best-effort, non-fatal.
-    try:
-        from explorer.embeddings import get_embedding_model
-        get_embedding_model()
-    except Exception as exc:
-        print(f"[warn] Could not pre-warm embeddings: {exc}", file=sys.stderr)
+    console = Console()
 
-    # Pre-warm Milvus client — best-effort, non-fatal.
-    try:
-        from explorer.multi_collection_store import MultiCollectionStore
-        MultiCollectionStore()._get_client()
-    except Exception:
-        pass
+    with Status("[bold green]Loading Project Explorer…[/bold green]", console=console, spinner="dots"):
+        # Pre-warm embedding model in the main thread — best-effort, non-fatal.
+        try:
+            from explorer.embeddings import get_embedding_model
+            get_embedding_model()
+        except Exception as exc:
+            console.print(f"[yellow]warn:[/yellow] Could not pre-warm embeddings: {exc}")
 
-    rag = RAGSystem()
+        # Pre-warm Milvus client — best-effort, non-fatal.
+        try:
+            from explorer.multi_collection_store import MultiCollectionStore
+            MultiCollectionStore()._get_client()
+        except Exception:
+            pass
 
-    # _get_agent() is called lazily on first query so BeeAI init stays in the
-    # worker thread (avoids asyncio loop conflicts with Textual's event loop).
-    conv = ConversationAgent(rag_system=rag)
+        rag = RAGSystem()
+
+        # _get_agent() is called lazily on first query so BeeAI init stays in the
+        # worker thread (avoids asyncio loop conflicts with Textual's event loop).
+        conv = ConversationAgent(rag_system=rag)
 
     ProjectExplorerApp(conv, rag).run()
 

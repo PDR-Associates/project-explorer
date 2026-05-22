@@ -80,7 +80,11 @@ _DATA_EXTENSIONS: dict[str, str] = {
 # Extensions that pandas can profile
 _PANDAS_READABLE: set[str] = {"csv", "tsv", "tab", "psv", "xlsx", "xls", "parquet", "feather", "arrow"}
 
-# Skip profiling files larger than this (to avoid memory issues)
+# Columnar formats where pyarrow can read schema + row count from file metadata
+# without loading any row data — no size limit needed for these.
+_SCHEMA_ONLY: set[str] = {"parquet", "feather", "arrow"}
+
+# Skip profiling CSV/Excel files larger than this (pandas must read bytes to infer types)
 _MAX_PROFILE_SIZE_MB = 50
 
 
@@ -125,7 +129,19 @@ class DataProfilerSurveyor(BaseSurveyor):
         try:
             rows = self.registry.get_file_inventory_with_sizes(self.project.slug)
             if not rows:
-                log.debug("DataProfilerSurveyor: no inventory for %s", self.project.slug)
+                results.append(
+                    RequestForActionAnnotation(
+                        summary="No file inventory found — data profiling skipped",
+                        analysis_step=STEP,
+                        confidence=100,
+                        explanation=(
+                            "project_file_inventory is empty. File inventory is populated "
+                            "during add/refresh. Run 'project-explorer refresh <slug>' to populate."
+                        ),
+                        action_requested="Run refresh to build file inventory",
+                        action_target_name=self.project.slug,
+                    )
+                )
                 return results
 
             data_files = self._filter_data_files(rows)
@@ -284,13 +300,15 @@ class DataProfilerSurveyor(BaseSurveyor):
         for f in data_files:
             if f["_ext"] not in _PANDAS_READABLE:
                 continue
-            if f["file_size_bytes"] > limit_bytes:
+            # Columnar formats use pyarrow metadata — no size limit needed.
+            # Only CSV/Excel require the size gate (pandas reads bytes to infer types).
+            if f["_ext"] not in _SCHEMA_ONLY and f["file_size_bytes"] > limit_bytes:
                 results.append(
                     RequestForActionAnnotation(
                         summary=f"Data file too large to profile: {f['file_path']} ({_fmt_size(f['file_size_bytes'])})",
                         analysis_step=STEP,
                         confidence=90,
-                        explanation=f"Exceeds the {_MAX_PROFILE_SIZE_MB} MB profiling limit.",
+                        explanation=f"Exceeds the {_MAX_PROFILE_SIZE_MB} MB profiling limit for text formats.",
                         action_requested="Profile large data file manually or reduce size",
                         action_target_name=f["file_path"],
                     )
@@ -321,6 +339,19 @@ class DataProfilerSurveyor(BaseSurveyor):
 
     @staticmethod
     def _profile_file(path: Path, ext: str, pd: Any) -> dict | None:
+        # Columnar formats: read schema + row count from file metadata only.
+        # pyarrow never loads row data for these paths, so no size limit applies.
+        if ext == "parquet":
+            result = DataProfilerSurveyor._profile_parquet(path)
+            if result is not None:
+                return result
+            # pyarrow not available — fall through to pandas below
+        if ext in {"feather", "arrow"}:
+            result = DataProfilerSurveyor._profile_arrow(path)
+            if result is not None:
+                return result
+
+        # Text / binary formats that require pandas to read rows
         if ext in {"csv", "tsv", "tab", "psv"}:
             sep = "\t" if ext in {"tsv", "tab"} else (";" if ext == "psv" else ",")
             try:
@@ -336,8 +367,66 @@ class DataProfilerSurveyor(BaseSurveyor):
         else:
             return None
 
-        row_count = len(df)
-        col_count = len(df.columns)
+        return DataProfilerSurveyor._summarize_df(df, path)
+
+    @staticmethod
+    def _profile_parquet(path: Path) -> dict | None:
+        """Read Parquet schema + row count from file metadata — no row data loaded."""
+        try:
+            import pyarrow.parquet as pq
+        except ImportError:
+            return None
+        try:
+            meta = pq.read_metadata(path)
+            schema = pq.read_schema(path)
+            columns = [
+                {"name": schema.field(i).name, "dtype": str(schema.field(i).type), "null_pct": 0.0}
+                for i in range(len(schema))
+            ]
+            return {
+                "row_count": meta.num_rows,
+                "col_count": len(schema),
+                "columns": columns[:50],
+                "null_summary": "",
+                "file_size": _fmt_size(path.stat().st_size),
+            }
+        except Exception as exc:
+            log.debug("_profile_parquet failed for %s: %s", path, exc)
+            return None
+
+    @staticmethod
+    def _profile_arrow(path: Path) -> dict | None:
+        """Read Arrow/Feather IPC schema + row count — only one column loaded for row count."""
+        try:
+            import pyarrow as pa
+        except ImportError:
+            return None
+        try:
+            with pa.memory_map(str(path), "r") as source:
+                reader = pa.ipc.open_file(source)
+                schema = reader.schema_arrow
+                # Read one column to get row count without loading all data
+                first_col = schema.names[0] if schema.names else None
+                table = reader.read_all([first_col] if first_col else [])
+                row_count = len(table)
+            columns = [
+                {"name": schema.field(i).name, "dtype": str(schema.field(i).type), "null_pct": 0.0}
+                for i in range(len(schema))
+            ]
+            return {
+                "row_count": row_count,
+                "col_count": len(schema),
+                "columns": columns[:50],
+                "null_summary": "",
+                "file_size": _fmt_size(path.stat().st_size),
+            }
+        except Exception as exc:
+            log.debug("_profile_arrow failed for %s: %s", path, exc)
+            return None
+
+    @staticmethod
+    def _summarize_df(df: Any, path: Path) -> dict:
+        """Build a profile dict from a loaded pandas DataFrame."""
         columns: list[dict] = []
         high_null_cols: list[str] = []
         for col in df.columns:
@@ -349,17 +438,15 @@ class DataProfilerSurveyor(BaseSurveyor):
             })
             if null_rate > 0.5:
                 high_null_cols.append(str(col))
-
         null_summary = ""
         if high_null_cols:
             null_summary = (
                 f"{len(high_null_cols)} column(s) >50% null: "
                 + ", ".join(high_null_cols[:5])
             )
-
         return {
-            "row_count": row_count,
-            "col_count": col_count,
+            "row_count": len(df),
+            "col_count": len(df.columns),
             "columns": columns[:50],
             "null_summary": null_summary,
             "file_size": _fmt_size(path.stat().st_size),

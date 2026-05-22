@@ -279,9 +279,10 @@ project-explorer egeria-reports myproject --full     # also fetch + display anno
 
 `project-explorer web` starts a FastAPI server and opens `http://127.0.0.1:8000` in your browser.
 
-- **Left sidebar** — project list with status indicators; click a project to scope all queries to it
+- **Left sidebar** — project list with status indicators; click a project to scope all queries to it. Hover over a project to reveal three action buttons: **🔄 Refresh & profile** (re-indexes the repo and populates data profiles — returns when complete), **📊 Survey** (runs the survey pipeline and switches to the Survey Report tab), **↗ Open on GitHub** (opens the GitHub URL in a new tab). Tooltips appear instantly on hover.
 - **Chat area** — markdown-rendered responses with 👍/👎 feedback buttons on each message
 - **Charts** — Plotly.js charts (Stars, Commits, Languages, Health, **File Types**, **Egeria**) rendered per selected project; the File Types chart uses Egeria-enriched type labels when a survey has been run, raw file extensions otherwise
+- **Survey Report tab** — health metric cards, file type donut chart, dependency bar chart, and a **Data Files** section showing column schemas, row counts, and null rates per profiled file. When data files are detected but no profiles exist, a hint prompts you to run `refresh`. Select file type rows and click **"Catalog selected →"** to create Egeria `DataSet` assets.
 - **Egeria tab** — shows registration status, asset GUID, and survey history from the local registry (no Egeria connection needed); click "▶ View" to expand annotations for any survey run (fetched live from Egeria); click "Publish survey →" to run a full survey and push to Egeria in one step, with inline success/error feedback
 - **Clarification flow** — if the agent needs a project name, the response prompts you; click a project in the sidebar or type its name to re-run your original question
 
@@ -407,7 +408,9 @@ File type data is **appended** on each run (not replaced), so you can track how 
 
 **Full file inventory**: `project-explorer refresh` stores every file path in the repo to `project_file_inventory` (SQLite), giving the surveyor visibility into YAML configs, shell scripts, and other non-vectorised files. Projects indexed before this feature was added should be refreshed once to populate the inventory.
 
-**Data profiling**: `add` and `refresh` automatically profile CSV, Excel, and Parquet files ≤50 MB while the repo is on disk. Results (row/col counts, column schemas, null rates) are stored in `project_data_profiles` and read at survey time — no local clone needed when running `survey`. Requires `pandas`; optional `openpyxl` (Excel) and `pyarrow` (Parquet).
+**Data profiling**: `add` and `refresh` automatically profile data files while the repo is on disk. Results are stored in `project_data_profiles` and read at survey time — no local clone needed. Parquet and Arrow/Feather use pyarrow to read schema and row count from file metadata (no size limit, no row data loaded). CSV and Excel use pandas with a 50 MB limit. Requires `pandas`; `pyarrow` recommended for Parquet/Arrow support.
+
+If `refresh` detects no new commits but `project_data_profiles` is empty, it automatically downloads the repo and runs profiling — so a plain `project-explorer refresh <slug>` is always sufficient to populate profiles, even when the code hasn't changed.
 
 See [docs/surveyor-reference.md](docs/surveyor-reference.md) for the complete surveyor reference.
 
@@ -510,9 +513,9 @@ explorer/
 │   │   └── index.html         # Single-page UI (Tailwind, Plotly.js, marked.js); Egeria tab with publish + annotation drill-down
 │   └── routes/
 │       ├── query.py           # POST /api/query/, POST /api/query/feedback
-│       ├── projects.py        # GET /api/projects/
+│       ├── projects.py        # GET/DELETE /api/projects/{slug} · POST /api/projects/{slug}/refresh (sync)
 │       ├── stats.py           # GET /api/stats/{slug}/charts/{type}
-│       └── egeria.py          # GET /api/egeria/{slug}/status|annotations · POST /api/egeria/{slug}/publish
+│       └── egeria.py          # GET /api/egeria/{slug}/status|annotations|survey-report · POST /api/egeria/{slug}/publish|survey|catalog-elements
 ├── tui/
 │   └── app.py                 # Textual full-screen TUI (clarification-aware)
 ├── dashboard/

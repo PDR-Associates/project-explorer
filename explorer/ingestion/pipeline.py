@@ -304,6 +304,7 @@ class IngestionPipeline:
             _DATA_EXTENSIONS,
             _MAX_PROFILE_SIZE_MB,
             _PANDAS_READABLE,
+            _SCHEMA_ONLY,
             DataProfilerSurveyor,
         )
 
@@ -334,7 +335,8 @@ class IngestionPipeline:
                 "file_size_bytes": size,
             }
 
-            if ext in _PANDAS_READABLE and size <= limit_bytes and size > 0:
+            size_ok = size > 0 and (ext in _SCHEMA_ONLY or size <= limit_bytes)
+            if ext in _PANDAS_READABLE and size_ok:
                 try:
                     result = DataProfilerSurveyor._profile_file(p, ext, pd)
                     if result:

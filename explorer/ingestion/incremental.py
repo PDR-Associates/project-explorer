@@ -36,6 +36,9 @@ class IncrementalIndexer:
         last_sha = self._get_last_sha(project.slug)
         if last_sha == latest_sha:
             print(f"No changes since last index ({latest_sha[:8]})")
+            # Still profile data files if that step was never run
+            if not self.registry.get_data_profiles(project.slug):
+                self._run_profile_only(repo, project)
             return
 
         changed_files = self._get_changed_files(repo, last_sha, latest_sha)
@@ -116,11 +119,27 @@ class IncrementalIndexer:
             if local_root is not None:
                 file_count, loc = pipeline._count_repo_stats(local_root)
                 self.registry.update_ingestion_stats(project.slug, file_count, loc)
+                pipeline._store_file_inventory(project.slug, local_root)
                 pipeline._parse_dependencies(project.slug, local_root)
+                pipeline._profile_data_files(project.slug, local_root)
 
         self.registry.update_indexed_at(project.slug, surviving)
         self.registry.update_status(project.slug, ProjectStatus.ACTIVE)
         self._store_last_sha(project.slug, latest_sha)
+
+    def _run_profile_only(self, repo, project: Project) -> None:
+        """Download the repo just to populate file inventory and data profiles."""
+        import tempfile
+        from pathlib import Path
+
+        pipeline = IngestionPipeline()
+        subproject_path = project.subproject_path or None
+        print("  Downloading repository for data profiling…")
+        with tempfile.TemporaryDirectory() as tmp:
+            local_root = self.client.download_zipball(repo, Path(tmp), subproject_path)
+            pipeline._store_file_inventory(project.slug, local_root)
+            pipeline._profile_data_files(project.slug, local_root)
+        print("  Data profiles updated.")
 
     def _get_changed_files(self, repo, old_sha: str, new_sha: str) -> list[str]:
         if not old_sha:

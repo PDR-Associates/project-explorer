@@ -196,7 +196,11 @@ Stats and Health use async generators with `yield TaskStatus(state=TaskState.inp
 
 `web/static/index.html` is a single-page app served by FastAPI:
 - Tailwind CSS (CDN), marked.js (CDN), Plotly.js (CDN)
-- Left sidebar: project list with status badges; click to scope queries
+- Left sidebar: project list with status badges; click to scope queries. Hover reveals three action buttons per project:
+  - 🔄 "Refresh & profile" — calls `POST /api/projects/{slug}/refresh` (synchronous), spins, shows ✓/✗
+  - 📊 "Run survey" — calls `POST /api/egeria/{slug}/survey`, switches to report tab on success
+  - ↗ "Open on GitHub" — `<a>` linking `project.github_url`
+  - Buttons use CSS `data-tip` tooltips (`.proj-action-btn[data-tip]::after`) — instant, no browser delay
 - Chat area: markdown-rendered responses, 👍/👎 feedback on each message
 - Charts: Stars, Commits, Languages, Health, **File Types**, **Egeria** — tab strip per selected project
   - Plotly charts fetched from `/api/stats/{slug}/charts/{type}`; File Types prefers surveyor data from `project_file_type_counts`
@@ -290,19 +294,31 @@ Egeria connection (all optional, standard pyegeria env vars):
 EGERIA_PLATFORM_URL, EGERIA_VIEW_SERVER, EGERIA_USER, EGERIA_USER_PASSWORD, PYEGERIA_TIMEOUT_SECONDS
 ```
 
-Web API routes (`web/routes/egeria.py`, prefix `/api/egeria`):
+Web API routes:
 ```
+# web/routes/projects.py  (prefix /api/projects)
+GET    /api/projects/                     → list[ProjectSummary]
+GET    /api/projects/{slug}               → ProjectSummary
+POST   /api/projects/{slug}/refresh       → RefreshResult {status, slug, message, error}
+                                            synchronous (asyncio.to_thread); detects empty profiles
+                                            and downloads repo even when no new commits exist
+DELETE /api/projects/{slug}               → {removed: slug}
+
+# web/routes/egeria.py  (prefix /api/egeria)
 GET  /api/egeria/{slug}/status            → {asset_guid, is_registered, platform_url, surveys[]}
 GET  /api/egeria/{slug}/annotations       → annotations[] from Egeria (requires live Egeria connection)
-GET  /api/egeria/{slug}/survey-report     → SurveyReportData from SQLite (no Egeria needed)
-POST /api/egeria/{slug}/publish           → full survey + publish; {status, report_guid, annotation_count}
-POST /api/egeria/{slug}/catalog-elements  → create DataSet assets in Egeria for selected file types
+GET  /api/egeria/{slug}/survey-report     → SurveyReportData from SQLite including data_profiles[]
+POST /api/egeria/{slug}/survey            → SurveyOnlyResult {status, annotation_count, surveyed_at, errors}
+POST /api/egeria/{slug}/publish           → PublishResult {status, report_guid, annotation_count, surveyed_at}
+POST /api/egeria/{slug}/catalog-elements  → CatalogResult; AssetMaker(view_server, platform_url, …) — note arg order
 ```
 
 Web UI — Survey Report tab (`web/static/index.html`):
 - Shown when a project is selected; click "📊 Survey Report" in the main nav bar
 - Fetches from `GET /api/egeria/{slug}/survey-report` (SQLite only, no Egeria needed)
-- Shows: health metric cards, Plotly donut chart for file types, dependency bar chart
+- Shows: health metric cards, Plotly donut chart for file types, dependency bar chart, **Data Files** section
+  - Data Files: per-file cards with path, format, size, row×col count, null warnings, column type pills
+  - When `data_profiles` is empty but `file_types` includes data-format labels (detected via substring match against "csv", "excel", "parquet", etc.): shows a "run refresh" hint with the exact command
 - File type rows have checkboxes — select any subset then "Catalog selected →" to create DataSet assets in Egeria
 - "💬 Ask about this" button pre-fills the chat input with a summary question and switches to Chat tab
 - Resizable sidebar: drag the 4px handle between sidebar and main panel; width persists in localStorage
@@ -365,9 +381,12 @@ Not every project gets every collection — `RepoAnalyzer` inspects the repo and
 28. Data file types (csv, xlsx, parquet, avro, orc, arrow, h5, npy, pkl, jsonl, sqlite, duckdb, gz, zip, pt, onnx, safetensors, etc.) must be in `_BUILTIN_BY_EXTENSION` in `type_cache.py` to appear in the file type survey. Without a matching entry they fall into the "Other" bucket. Adding a new format means adding it in both `type_cache.py` and `_DATA_EXTENSIONS` in `data_profiler.py`.
 29. `IngestionPipeline._profile_data_files()` runs after `_store_file_inventory()` while the repo is still in the temp directory. It profiles CSV/XLSX/Parquet files ≤50 MB using pandas and stores results in `project_data_profiles`. Because the temp dir is deleted after `run()` returns, this is the only point where local file content is accessible. Do not try to read data file content from the surveyor at survey time — read from `project_data_profiles` instead.
 30. `DataProfilerSurveyor` has two tiers: Tier 1 reads `project_file_inventory` for counts/sizes (always runs); Tier 2 reads `project_data_profiles` for column-level schema annotations (runs when stored profiles exist). The `--data-path` CLI flag on `survey` forces fresh local profiling by passing `local_path=` to the surveyor constructor, bypassing the stored profiles. Use this when you want updated profiles without a full `refresh`.
-31. Web UI "Survey Report" tab: fetches `GET /api/egeria/{slug}/survey-report` (SQLite only, no Egeria). Sidebar is resizable by dragging the 4px `#resize-handle` div between `<aside id="sidebar">` and `<main>`; width persists in `localStorage` under key `pe_sidebar_w`. Catalog checkboxes in the file type list POST to `POST /api/egeria/{slug}/catalog-elements`.
+31. Web UI "Survey Report" tab: fetches `GET /api/egeria/{slug}/survey-report` (SQLite only, no Egeria). Includes `data_profiles[]` from `project_data_profiles`. Shows a "Data Files" section with per-file cards (path, format, size, row×col, column type pills). When profiles are empty but data-format file types are detected, shows a hint with the `refresh` command. `hasDataFiles` detects data labels via substring match (e.g., "csv", "excel", "parquet") because type_cache labels are "CSV Data File", "Excel Spreadsheet", "Parquet Data File" — not bare format names. Catalog checkboxes POST to `/api/egeria/{slug}/catalog-elements`. Sidebar resizable via 4px `#resize-handle`; width in `localStorage` key `pe_sidebar_w`.
 32. `survey` and `refresh` accept multiple slugs (`survey proj1 proj2`) or `--all` (all registered projects) with optional `--top-level` to skip sub-projects. Batch mode prints condensed per-project output and a Rich table summary at the end. `survey --all` creates one `SurveyOrchestrator` shared across all projects (single Egeria connection). The governance action prompt is suppressed in batch mode.
 33. Sub-projects (`parent_slug` set) share the parent repo's GitHub URL. `EgeriaPublisher` uses `SourceControlLibrary::{github_url}` as the qualifiedName, so sub-projects from the same repo share one Egeria asset — the first publish creates it, subsequent ones reuse it via the cached `egeria_asset_guid`. Each sub-project still gets its own `SurveyReport` linked to that shared asset. File inventory and data profiles are scoped to `code_root = full_root / subproject_path`, so each sub-project only sees files within its subdirectory. `--top-level` on `survey --all` or `refresh --all` skips sub-projects; omit it to include them.
+34. `IncrementalIndexer.refresh()` always calls `_store_file_inventory()` and `_profile_data_files()` when the repo is downloaded (any path that has file-based collections to re-index). When no new commits are found (`last_sha == latest_sha`) but `project_data_profiles` is empty, it calls `_run_profile_only()` which downloads the repo just for profiling. This means `project-explorer refresh <slug>` always populates profiles — never rely on telling users to re-add a project just to get profiles.
+35. `AssetMaker` constructor argument order is `(view_server, platform_url, user_id, user_password)` — note that `view_server` comes first, unlike some pyegeria examples. Swapping to `(platform_url, view_server, …)` passes the view server name as the URL and produces `VALIDATION_ERROR_1 → Invalid URL`. Verify against `EgeriaPublisher._connect()` as the canonical reference.
+36. `POST /api/projects/{slug}/refresh` is synchronous (uses `asyncio.to_thread`), not a background task. It captures stdout from `IncrementalIndexer.refresh()` and returns `RefreshResult {status, slug, message, error}`. The web sidebar 🔄 button spins until it completes and shows ✓/✗. Do not revert to `BackgroundTasks` — the UI needs the result to know when to reload the report tab.
 
 
 ## Module Map

@@ -395,6 +395,18 @@ def _print_survey_report(result) -> None:
             console.print(f"  • {ann.summary}")
             if ann.explanation:
                 console.print(f"    [dim]{ann.explanation}[/dim]")
+            # Show column-level schema for data file profiles
+            if (
+                ann_type == AnnotationType.SCHEMA_ANALYSIS
+                and getattr(ann, "analysis_step", "") == "DataProfiling"
+                and ann.json_properties.get("columns")
+            ):
+                cols = ann.json_properties["columns"]
+                shown = cols[:8]
+                parts = [f"{c['name']} ({c['dtype']})" for c in shown]
+                if len(cols) > 8:
+                    parts.append(f"+{len(cols) - 8} more")
+                console.print(f"    [dim]Columns: {', '.join(parts)}[/dim]")
         console.print()
 
     if result.errors:

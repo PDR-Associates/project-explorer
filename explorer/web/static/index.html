@@ -57,6 +57,16 @@
     .catalog-cb { accent-color:#06b6d4; cursor:pointer; }
     .catalog-row { display:flex; align-items:center; gap:.4rem; padding:.15rem 0; font-size:.72rem; color:#94a3b8; cursor:pointer; }
     .catalog-row:hover { color:#e2e8f0; }
+    /* Sidebar project action buttons */
+    .proj-actions { opacity:0; transition:opacity .12s; display:flex; align-items:center; gap:2px; flex-shrink:0; }
+    .project-btn:hover .proj-actions { opacity:1; }
+    .proj-action-btn { position:relative; padding:2px 5px; border-radius:4px; font-size:.65rem; line-height:1; color:#64748b; background:transparent; border:none; cursor:pointer; transition:color .12s,background .12s; }
+    .proj-action-btn:hover { color:#e2e8f0; background:#334155; }
+    .proj-action-btn.spinning { animation:spin .8s linear infinite; display:inline-block; pointer-events:none; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    /* CSS tooltip for action buttons */
+    .proj-action-btn[data-tip]::after { content:attr(data-tip); position:absolute; bottom:calc(100% + 4px); left:50%; transform:translateX(-50%); background:#1e293b; color:#e2e8f0; font-size:.6rem; white-space:nowrap; padding:2px 6px; border-radius:3px; pointer-events:none; opacity:0; transition:opacity .1s; border:1px solid #334155; }
+    .proj-action-btn[data-tip]:hover::after { opacity:1; }
   </style>
 </head>
 <body class="dark bg-slate-900 text-slate-100 h-screen flex flex-col overflow-hidden">
@@ -197,8 +207,20 @@ async function loadProjects() {
     const btn = document.createElement('button');
     btn.className = 'project-btn w-full text-left px-3 py-1.5 rounded text-sm hover:bg-slate-700 transition-colors';
     btn.dataset.slug = p.slug;
+    btn.dataset.githubUrl = p.github_url || '';
     btn.onclick = (e) => e.shiftKey ? toggleCompare(p.slug) : selectProject(p.slug);
-    btn.innerHTML = `<div class="font-medium text-slate-200 truncate">${p.display_name}</div>
+    btn.innerHTML = `
+      <div class="flex items-center justify-between gap-1 min-w-0">
+        <div class="font-medium text-slate-200 truncate">${_esc(p.display_name)}</div>
+        <div class="proj-actions">
+          <button class="proj-action-btn" data-tip="Refresh &amp; profile"
+            onclick="event.stopPropagation(); runRefreshFromSidebar('${_esc(p.slug)}', this)">🔄</button>
+          <button class="proj-action-btn" data-tip="Run survey"
+            onclick="event.stopPropagation(); runSurveyFromSidebar('${_esc(p.slug)}', this)">📊</button>
+          ${p.github_url ? `<a class="proj-action-btn" href="${_esc(p.github_url)}" target="_blank"
+            data-tip="Open on GitHub" onclick="event.stopPropagation()">↗</a>` : ''}
+        </div>
+      </div>
       <div class="text-xs ${color}">${p.status} · ${p.collections.length} collections</div>`;
     list.appendChild(btn);
   });
@@ -232,6 +254,67 @@ function selectProject(slug) {
     document.getElementById('charts-section').classList.add('hidden');
     document.getElementById('main-nav').classList.add('hidden');
     document.querySelectorAll('.project-btn[data-slug=""]').forEach(b => b.classList.add('selected'));
+  }
+}
+
+async function runRefreshFromSidebar(slug, btn) {
+  const orig = btn.textContent;
+  btn.textContent = '⟳';
+  btn.classList.add('spinning');
+  btn.disabled = true;
+
+  try {
+    const res = await fetch(`/api/projects/${slug}/refresh`, { method: 'POST' });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      btn.textContent = '✓';
+      btn.style.color = '#4ade80';
+      // Reload survey report if it's the active view
+      if (selectedProject === slug) { _reportLoaded = false; loadSurveyReport(); }
+      setTimeout(() => { btn.textContent = orig; btn.style.color = ''; btn.disabled = false; btn.classList.remove('spinning'); }, 2500);
+    } else {
+      btn.textContent = '✗';
+      btn.title = data.error || 'Refresh failed';
+      btn.style.color = '#f87171';
+      setTimeout(() => { btn.textContent = orig; btn.title = ''; btn.style.color = ''; btn.disabled = false; btn.classList.remove('spinning'); }, 4000);
+    }
+  } catch(e) {
+    btn.textContent = '✗';
+    btn.style.color = '#f87171';
+    setTimeout(() => { btn.textContent = orig; btn.style.color = ''; btn.disabled = false; btn.classList.remove('spinning'); }, 2500);
+  }
+}
+
+async function runSurveyFromSidebar(slug, btn) {
+  // Select the project so the report tab is in context
+  selectProject(slug);
+
+  // Show spinner on the button
+  const orig = btn.textContent;
+  btn.textContent = '⟳';
+  btn.classList.add('spinning');
+  btn.disabled = true;
+
+  try {
+    const res = await fetch(`/api/egeria/${slug}/survey`, { method: 'POST' });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      // Switch to report tab and reload it
+      showMainView('report');
+      _reportLoaded = false;
+      loadSurveyReport();
+      btn.textContent = '✓';
+      btn.style.color = '#4ade80';
+      setTimeout(() => { btn.textContent = orig; btn.style.color = ''; btn.disabled = false; btn.classList.remove('spinning'); }, 2500);
+    } else {
+      btn.textContent = '✗';
+      btn.style.color = '#f87171';
+      setTimeout(() => { btn.textContent = orig; btn.style.color = ''; btn.disabled = false; btn.classList.remove('spinning'); }, 2500);
+    }
+  } catch(e) {
+    btn.textContent = '✗';
+    btn.style.color = '#f87171';
+    setTimeout(() => { btn.textContent = orig; btn.style.color = ''; btn.disabled = false; btn.classList.remove('spinning'); }, 2500);
   }
 }
 
@@ -863,6 +946,63 @@ function renderSurveyReport(data) {
           Catalog selected →
         </button>
         <span id="catalog-feedback" class="text-xs text-slate-500"></span>
+      </div>
+    </div>`;
+  }
+
+  // Data profiles section
+  // Match labels from FileTypeCache: "CSV Data File", "Excel Spreadsheet", "Parquet Data File", etc.
+  const _dataKeywords = ['csv','excel','parquet','avro','orc','arrow','hdf','numpy','json line','sqlite','duckdb','pickle','data file'];
+  const hasDataFiles = (data.file_types || []).some(ft =>
+    _dataKeywords.some(kw => ft.label.toLowerCase().includes(kw))
+  );
+  if (data.data_profiles && data.data_profiles.length) {
+    const profiled = data.data_profiles.filter(p => p.row_count != null);
+    const unprofiledCount = data.data_profiles.length - profiled.length;
+    html += `<div class="rpt-section">
+      <div class="rpt-section-title">Data Files
+        <span class="text-slate-600 ml-1 normal-case font-normal text-xs">${data.data_profiles.length} file(s)</span>
+      </div>`;
+    if (profiled.length) {
+      html += `<div class="space-y-2">`;
+      for (const p of profiled) {
+        const sizeKb = p.file_size_bytes > 0 ? (p.file_size_bytes >= 1048576
+          ? (p.file_size_bytes/1048576).toFixed(1)+' MB'
+          : (p.file_size_bytes/1024).toFixed(0)+' KB') : '';
+        const colCount = p.col_count ?? 0;
+        const shownCols = (p.columns || []).slice(0, 6);
+        const moreCols = colCount - shownCols.length;
+        const colPills = shownCols.map(c => {
+          const nullBadge = c.null_pct > 50 ? ' text-amber-400' : ' text-slate-500';
+          return `<span class="inline-flex items-center gap-1 text-xs bg-slate-800 rounded px-1.5 py-0.5">
+            <span class="text-slate-200">${_esc(c.name)}</span>
+            <span class="${nullBadge}">${_esc(c.dtype)}</span>
+            ${c.null_pct > 0 ? `<span class="text-slate-600">${c.null_pct}%∅</span>` : ''}
+          </span>`;
+        }).join('');
+        html += `<div class="rounded bg-slate-800 px-3 py-2 space-y-1">
+          <div class="flex items-baseline justify-between gap-2">
+            <span class="text-slate-200 text-xs font-mono truncate">${_esc(p.file_path)}</span>
+            <span class="text-slate-500 text-xs whitespace-nowrap">${_esc(p.format)}${sizeKb ? ' · '+sizeKb : ''}</span>
+          </div>
+          <div class="text-xs text-slate-400">${(p.row_count??0).toLocaleString()} rows × ${colCount} columns</div>
+          ${p.null_summary ? `<div class="text-xs text-amber-400/80">⚠ ${_esc(p.null_summary)}</div>` : ''}
+          <div class="flex flex-wrap gap-1 mt-1">${colPills}${moreCols > 0 ? `<span class="text-xs text-slate-600">+${moreCols} more</span>` : ''}</div>
+        </div>`;
+      }
+      html += `</div>`;
+    }
+    if (unprofiledCount > 0) {
+      html += `<div class="text-xs text-slate-600 mt-1">${unprofiledCount} file(s) not profiled (too large or unsupported format)</div>`;
+    }
+    html += `</div>`;
+  } else if (hasDataFiles) {
+    html += `<div class="rpt-section">
+      <div class="rpt-section-title">Data Files</div>
+      <div class="text-xs text-slate-500 bg-slate-900 rounded px-3 py-2.5">
+        Data file inventory detected but no column profiles yet.<br>
+        Run <code class="text-cyan-400 font-mono">project-explorer refresh ${_esc(data.slug)}</code>
+        to profile CSV, Excel, and Parquet files (column names, row counts, null rates).
       </div>
     </div>`;
   }

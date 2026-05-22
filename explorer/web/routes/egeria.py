@@ -70,6 +70,17 @@ class DependencySummary(BaseModel):
     direct: int
 
 
+class DataProfileSummary(BaseModel):
+    file_path: str
+    format: str
+    row_count: int | None = None
+    col_count: int | None = None
+    columns: list[dict] = []      # [{name, dtype, null_pct}]
+    null_summary: str = ""
+    file_size_bytes: int = 0
+    profiled_at: str | None = None
+
+
 class SurveyReportData(BaseModel):
     slug: str
     display_name: str
@@ -81,6 +92,7 @@ class SurveyReportData(BaseModel):
     primary_language: str
     dependencies: list[DependencySummary]
     has_egeria_annotations: bool
+    data_profiles: list[DataProfileSummary] = []
 
 
 class CatalogElement(BaseModel):
@@ -187,6 +199,41 @@ async def get_annotations(slug: str, surveyed_at: str, report_guid: str = "") ->
         surveyed_at=surveyed_at,
         report_guid=report_guid,
         annotations=annotations,
+    )
+
+
+class SurveyOnlyResult(BaseModel):
+    status: str                      # "ok" | "error"
+    annotation_count: int | None = None
+    surveyed_at: str | None = None
+    errors: list[str] = []
+    error: str | None = None
+
+
+@router.post("/{slug}/survey", response_model=SurveyOnlyResult)
+async def run_survey(slug: str) -> SurveyOnlyResult:
+    """Run a survey for a project and persist results to SQLite.
+
+    Does not publish to Egeria. Updates project_file_type_counts so the
+    Survey Report tab refreshes automatically after this call completes.
+    """
+    project, registry = _get_project_or_404(slug)
+
+    try:
+        from explorer.surveyors.survey_orchestrator import SurveyOrchestrator
+
+        def _run():
+            return SurveyOrchestrator(registry=registry).run(slug)
+
+        result = await asyncio.to_thread(_run)
+    except Exception as exc:
+        return SurveyOnlyResult(status="error", error=str(exc))
+
+    return SurveyOnlyResult(
+        status="ok",
+        annotation_count=len(result.annotations),
+        surveyed_at=result.surveyed_at.isoformat(),
+        errors=result.errors,
     )
 
 
@@ -298,6 +345,27 @@ async def get_survey_report(slug: str) -> SurveyReportData:
         for v in sorted(dep_map.values(), key=lambda x: -x["count"])
     ]
 
+    # Data profiles from project_data_profiles
+    raw_profiles = registry.get_data_profiles(slug)
+    data_profiles: list[DataProfileSummary] = []
+    for p in raw_profiles:
+        cols: list[dict] = []
+        if p.get("schema_json"):
+            try:
+                cols = _json.loads(p["schema_json"])
+            except Exception:
+                pass
+        data_profiles.append(DataProfileSummary(
+            file_path=p["file_path"],
+            format=p["format"],
+            row_count=p.get("row_count"),
+            col_count=p.get("col_count"),
+            columns=cols,
+            null_summary=p.get("null_summary") or "",
+            file_size_bytes=p.get("file_size_bytes") or 0,
+            profiled_at=p.get("profiled_at"),
+        ))
+
     # Latest Egeria survey (may be None if never published)
     latest_raw = registry.get_latest_egeria_survey(slug)
     latest_survey: SurveyRow | None = None
@@ -320,6 +388,7 @@ async def get_survey_report(slug: str) -> SurveyReportData:
         primary_language=stats.get("primary_language", ""),
         dependencies=dep_summary,
         has_egeria_annotations=latest_survey is not None,
+        data_profiles=data_profiles,
     )
 
 
@@ -351,7 +420,7 @@ async def catalog_elements(slug: str, request: CatalogRequest) -> CatalogResult:
                 "Project not yet registered in Egeria — publish a survey first."
             )
 
-        am = AssetMaker(_platform_url(), view_server, user_id, user_pwd)
+        am = AssetMaker(view_server, _platform_url(), user_id, user_pwd)
         am.create_egeria_bearer_token(user_id, user_pwd)
 
         results: list[CatalogItemResult] = []
