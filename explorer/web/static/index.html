@@ -686,22 +686,24 @@ async function runQuery(query, projectSlug) {
           // Symbol table for code_inventory queries
           if (event.symbol_table && event.symbol_table.items && event.symbol_table.items.length) {
             const st = event.symbol_table;
+            const tableId = `sym-table-${Date.now()}`;
             const tableWrap = document.createElement('div');
             tableWrap.className = 'mt-3 overflow-x-auto rounded border border-slate-700';
             const caption = `${st.total} ${st.kind === 'all' ? 'symbol' : st.kind}(s) in ${st.project}` +
               (st.total > st.items.length ? ` — showing first ${st.items.length}` : '');
             tableWrap.innerHTML = `
-              <div class="px-3 py-1.5 bg-slate-800 text-xs text-slate-400 flex justify-between items-center">
+              <div class="px-3 py-1.5 bg-slate-800 text-xs text-slate-400 flex justify-between items-center gap-2 flex-wrap">
                 <span>${caption}</span>
-                <span class="text-slate-600">Shift+click column header to sort</span>
+                <input type="search" placeholder="Filter…" oninput="filterSymTable(this,'${tableId}')"
+                  class="ml-auto px-2 py-0.5 rounded bg-slate-700 border border-slate-600 text-slate-200 text-xs w-36 focus:outline-none focus:border-slate-400 placeholder-slate-500" />
               </div>
-              <table class="w-full text-xs" id="sym-table-${Date.now()}">
+              <table class="w-full text-xs" id="${tableId}">
                 <thead class="bg-slate-800/80 text-slate-400">
                   <tr>
-                    <th class="px-2 py-1 text-left cursor-pointer hover:text-slate-200 select-none" onclick="sortSymTable(this,0)">Kind</th>
-                    <th class="px-2 py-1 text-left cursor-pointer hover:text-slate-200 select-none" onclick="sortSymTable(this,1)">Name</th>
-                    <th class="px-2 py-1 text-left cursor-pointer hover:text-slate-200 select-none hidden sm:table-cell" onclick="sortSymTable(this,2)">Signature</th>
-                    <th class="px-2 py-1 text-left cursor-pointer hover:text-slate-200 select-none hidden md:table-cell" onclick="sortSymTable(this,3)">File</th>
+                    <th class="px-2 py-1 text-left cursor-pointer hover:text-slate-200 select-none" onclick="sortSymTable(this,0)">Kind ↕</th>
+                    <th class="px-2 py-1 text-left cursor-pointer hover:text-slate-200 select-none" onclick="sortSymTable(this,1)">Name ↕</th>
+                    <th class="px-2 py-1 text-left cursor-pointer hover:text-slate-200 select-none hidden sm:table-cell" onclick="sortSymTable(this,2)">Signature ↕</th>
+                    <th class="px-2 py-1 text-left cursor-pointer hover:text-slate-200 select-none hidden md:table-cell" onclick="sortSymTable(this,3)">File ↕</th>
                     <th class="px-2 py-1 text-left text-slate-600 hidden lg:table-cell">Purpose</th>
                   </tr>
                 </thead>
@@ -717,6 +719,49 @@ async function runQuery(query, projectSlug) {
                 </tbody>
               </table>`;
             wrap.appendChild(tableWrap);
+          }
+
+          // compare_symbols: side-by-side API surface diff for comparison queries
+          if (event.compare_symbols && event.compare_symbols.sides && event.compare_symbols.sides.length >= 2) {
+            const cs = event.compare_symbols;
+            const [a, b] = cs.sides;
+            const kindLabel = cs.kind === 'all' ? 'symbol' : cs.kind;
+            const allKinds = [...new Set([...Object.keys(a.counts), ...Object.keys(b.counts)])].sort();
+
+            const renderSide = (side) => {
+              const countRows = allKinds.map(k => `
+                <tr class="hover:bg-slate-700/20">
+                  <td class="px-2 py-0.5 text-cyan-400 font-mono">${k}</td>
+                  <td class="px-2 py-0.5 text-right text-slate-300">${side.counts[k] ?? 0}</td>
+                </tr>`).join('');
+              const itemRows = side.items.map(s => `
+                <tr class="hover:bg-slate-700/30 transition-colors">
+                  <td class="px-2 py-1 text-cyan-400 font-mono text-xs">${s.kind}</td>
+                  <td class="px-2 py-1 text-slate-200 font-mono text-xs truncate max-w-[12rem]">${s.name}</td>
+                  <td class="px-2 py-1 text-slate-500 text-xs truncate max-w-[10rem] hidden md:table-cell">${s.file}</td>
+                </tr>`).join('');
+              return `
+                <div class="flex-1 min-w-0">
+                  <div class="px-2 py-1 bg-slate-800 text-xs font-semibold text-emerald-400 border-b border-slate-700">${side.slug} — ${side.total} ${kindLabel}(s)</div>
+                  <table class="w-full text-xs mb-1">
+                    <tbody class="divide-y divide-slate-700/30">${countRows}</tbody>
+                  </table>
+                  <div class="px-2 py-0.5 text-xs text-slate-500 bg-slate-800/50">${side.items.length < side.total ? `Top ${side.items.length}` : 'All'} ${kindLabel}s</div>
+                  <table class="w-full text-xs">
+                    <tbody class="divide-y divide-slate-700/30">${itemRows}</tbody>
+                  </table>
+                </div>`;
+            };
+
+            const csWrap = document.createElement('div');
+            csWrap.className = 'mt-3 rounded border border-slate-700 overflow-hidden';
+            csWrap.innerHTML = `
+              <div class="px-3 py-1.5 bg-slate-800 text-xs text-slate-400">API surface comparison — ${kindLabel}s</div>
+              <div class="flex gap-px bg-slate-700">
+                ${renderSide(a)}
+                ${renderSide(b)}
+              </div>`;
+            wrap.appendChild(csWrap);
           }
 
           // Alias suggestion banner
@@ -799,6 +844,16 @@ function sortSymTable(th, colIdx) {
     return asc ? av.localeCompare(bv) : bv.localeCompare(av);
   });
   rows.forEach(r => tbody.appendChild(r));
+}
+
+function filterSymTable(input, tableId) {
+  const q = input.value.toLowerCase();
+  const table = document.getElementById(tableId);
+  if (!table) return;
+  table.querySelectorAll('tbody tr').forEach(row => {
+    const text = row.textContent.toLowerCase();
+    row.style.display = text.includes(q) ? '' : 'none';
+  });
 }
 
 async function confirmAlias(term, slug, banner) {

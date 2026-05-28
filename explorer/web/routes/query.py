@@ -218,6 +218,9 @@ async def stream(request: QueryRequest) -> StreamingResponse:
                 # Structured symbol table for code_inventory queries
                 if intent_val == "code_inventory" and request.project_slug:
                     done["symbol_table"] = _code_inventory_table(request.query, request.project_slug)
+                # Side-by-side symbol comparison for comparison queries about API surface
+                if intent_val == "comparison":
+                    done["compare_symbols"] = _compare_symbols_table(request.query)
                 # Suggest an alias when no project was resolved but a fuzzy match exists
                 if not request.project_slug:
                     alias_hint = _fuzzy_alias_suggestion(request.query)
@@ -302,6 +305,90 @@ def _code_inventory_table(query: str, project_slug: str) -> dict | None:
                 for r in rows
             ],
         }
+    except Exception:
+        return None
+
+
+def _compare_symbols_table(query: str) -> dict | None:
+    """
+    Build a side-by-side symbol comparison payload when the comparison query
+    is about API surface, classes, or methods. Returns None if fewer than two
+    projects have symbol data or the query isn't about code structure.
+    """
+    import re
+    import sqlite3
+
+    _SYMBOL_KEYWORDS = ("class", "method", "function", "interface", "api surface", "symbol", "public")
+    q = query.lower()
+    if not any(w in q for w in _SYMBOL_KEYWORDS):
+        return None
+
+    kind = "all"
+    for k in ("class", "method", "function", "interface"):
+        if k in q:
+            kind = k
+            break
+
+    try:
+        from explorer.registry import ProjectRegistry
+        from explorer.agents.compare_agent import CompareAgent
+
+        registry = ProjectRegistry()
+        slugs = CompareAgent()._infer_all_project_slugs(query)
+        if len(slugs) < 2:
+            return None
+
+        conn = sqlite3.connect(registry.db_path)
+        conn.row_factory = sqlite3.Row
+
+        sides = []
+        for slug in slugs[:2]:
+            filters = ["project_slug = ?"]
+            params: list = [slug]
+            if kind != "all":
+                filters.append("kind = ?")
+                params.append(kind)
+            where = " AND ".join(filters)
+
+            counts_rows = conn.execute(
+                f"SELECT kind, COUNT(*) as cnt FROM project_code_symbols WHERE {where} GROUP BY kind",  # noqa: S608
+                params,
+            ).fetchall()
+            counts = {r["kind"]: r["cnt"] for r in counts_rows}
+
+            items_rows = conn.execute(
+                f"SELECT kind, qualified_name, signature, docstring, file_path, start_line "  # noqa: S608
+                f"FROM project_code_symbols WHERE {where} ORDER BY kind, file_path, start_line LIMIT 20",
+                params,
+            ).fetchall()
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM project_code_symbols WHERE {where}",  # noqa: S608
+                params,
+            ).fetchone()[0]
+
+            sides.append({
+                "slug": slug,
+                "total": total,
+                "counts": counts,
+                "items": [
+                    {
+                        "kind": r["kind"],
+                        "name": r["qualified_name"],
+                        "signature": r["signature"] or "",
+                        "doc": (r["docstring"] or "")[:80],
+                        "file": r["file_path"],
+                        "line": r["start_line"],
+                    }
+                    for r in items_rows
+                ],
+            })
+
+        conn.close()
+
+        if not any(s["total"] > 0 for s in sides):
+            return None
+
+        return {"kind": kind, "sides": sides}
     except Exception:
         return None
 
