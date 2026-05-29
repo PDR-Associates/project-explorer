@@ -202,12 +202,36 @@ async def get_annotations(slug: str, surveyed_at: str, report_guid: str = "") ->
     )
 
 
+class ResetResult(BaseModel):
+    status: str                  # "ok"
+    slug: str
+    asset_guid_cleared: bool
+    surveys_deleted: int
+
+
 class SurveyOnlyResult(BaseModel):
     status: str                      # "ok" | "error"
     annotation_count: int | None = None
     surveyed_at: str | None = None
     errors: list[str] = []
     error: str | None = None
+
+
+@router.post("/{slug}/reset", response_model=ResetResult)
+async def reset_egeria(slug: str) -> ResetResult:
+    """Clear the cached Egeria asset GUID and all published survey records for a project.
+
+    Use this after resetting the Egeria database so the next --publish re-registers
+    the project from scratch instead of referencing stale GUIDs.
+    """
+    project, registry = _get_project_or_404(slug)
+    result = registry.clear_egeria_registration(slug)
+    return ResetResult(
+        status="ok",
+        slug=slug,
+        asset_guid_cleared=result["asset_guid_cleared"],
+        surveys_deleted=result["surveys_deleted"],
+    )
 
 
 @router.post("/{slug}/survey", response_model=SurveyOnlyResult)

@@ -65,7 +65,7 @@ class OnboardingWizard:
                 self.console.print(f"[red]Failed to analyze repository:[/red] {exc}")
             return
 
-        slug = slug_override or self._url_to_slug(github_url)
+        slug = re.sub(r"[^a-z0-9_]", "_", slug_override.lower()) if slug_override else self._url_to_slug(github_url)
         if subproject_path and not slug_override:
             # Derive slug from subpath when no override given: repo_subpath
             subpath_slug = re.sub(r"[^a-z0-9_]", "_", subproject_path.strip("/").replace("/", "_").lower())

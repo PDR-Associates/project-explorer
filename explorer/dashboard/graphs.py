@@ -178,12 +178,26 @@ def language_breakdown_plotly(project_slug: str) -> "plotly.graph_objects.Figure
     if row.get("language_breakdown"):
         try:
             raw = row["language_breakdown"]
-            # StatsFetcher stores as str(dict); try json first, then eval-safe ast
-            try:
-                breakdown: dict = json.loads(raw)
-            except json.JSONDecodeError:
-                import ast
-                breakdown = ast.literal_eval(raw)
+            # StatsFetcher stores as "Python: 426,777 bytes; Shell: 19,452 bytes; ..."
+            # Try that format first, then fall back to JSON / ast for legacy data.
+            if ": " in raw and " bytes" in raw:
+                breakdown: dict = {}
+                for part in raw.split(";"):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    lang, _, rest = part.partition(": ")
+                    num_str = rest.replace(" bytes", "").replace(",", "").strip()
+                    try:
+                        breakdown[lang.strip()] = int(num_str)
+                    except ValueError:
+                        pass
+            else:
+                try:
+                    breakdown = json.loads(raw)
+                except json.JSONDecodeError:
+                    import ast
+                    breakdown = ast.literal_eval(raw)
             labels = list(breakdown.keys())
             values = list(breakdown.values())
         except Exception:

@@ -50,7 +50,9 @@ class MultiCollectionStore:
         return self._client
 
     def collection_name(self, project_slug: str, collection_type: str) -> str:
-        return f"{project_slug}_{collection_type}"
+        import re as _re
+        safe_slug = _re.sub(r"[^a-z0-9_]", "_", project_slug.lower())
+        return f"{safe_slug}_{collection_type}"
 
     def _ensure_collection(self, collection: str) -> None:
         client = self._get_client()

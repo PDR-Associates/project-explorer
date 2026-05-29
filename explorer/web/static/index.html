@@ -451,12 +451,19 @@ function renderEgeriaPanel(panel, data) {
   }
 
   panel.innerHTML = `
-    <div class="flex items-center justify-between mb-1">
+    <div class="flex items-center justify-between mb-1 gap-1 flex-wrap">
       <span class="text-xs px-2 py-0.5 rounded font-medium ${badgeCls}">${badgeText}</span>
-      <button id="publish-btn" onclick="publishSurvey()"
-        class="text-xs px-2 py-0.5 rounded bg-cyan-800 hover:bg-cyan-700 text-white font-medium transition-colors">
-        Publish survey →
-      </button>
+      <div class="flex gap-1">
+        <button id="publish-btn" onclick="publishSurvey()"
+          class="text-xs px-2 py-0.5 rounded bg-cyan-800 hover:bg-cyan-700 text-white font-medium transition-colors">
+          Publish survey →
+        </button>
+        ${registered ? `<button onclick="resetEgeria(this)"
+          title="Clear cached GUIDs and survey history (use after resetting the Egeria database)"
+          class="text-xs px-2 py-0.5 rounded bg-slate-700 hover:bg-red-900 text-slate-400 hover:text-red-300 transition-colors">
+          ↺ Reset
+        </button>` : ''}
+      </div>
     </div>
     ${guidRow}
     <div id="publish-feedback" class="text-xs mt-1"></div>
@@ -487,6 +494,23 @@ async function publishSurvey() {
     fb.innerHTML = `<span class="text-red-400">Request failed: ${e.message}</span>`;
     btn.disabled = false;
     btn.textContent = 'Retry →';
+  }
+}
+
+async function resetEgeria(btn) {
+  if (!selectedProject) return;
+  if (!confirm(`Clear all cached Egeria GUIDs and survey history for "${selectedProject}"?\n\nDo this after resetting the Egeria database. The next publish will re-register from scratch.`)) return;
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const res = await fetch(`/api/egeria/${selectedProject}/reset`, { method: 'POST' });
+    const data = await res.json();
+    // Refresh the panel to reflect cleared state
+    setTimeout(() => showEgeria(), 300);
+  } catch(e) {
+    btn.disabled = false;
+    btn.textContent = '↺ Reset';
+    document.getElementById('publish-feedback').innerHTML = `<span class="text-red-400">Reset failed: ${e.message}</span>`;
   }
 }
 

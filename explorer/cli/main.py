@@ -650,6 +650,58 @@ def survey(
     _print_batch_summary(targets, failed, "surveyed")
 
 
+@app.command(name="egeria-reset")
+def egeria_reset(
+    slugs: Optional[list[str]] = typer.Argument(default=None, help="Project slug(s) to reset"),
+    all_projects: bool = typer.Option(False, "--all", help="Reset all registered projects"),
+):
+    """Clear cached Egeria GUIDs and survey history for one or more projects.
+
+    Use this after resetting the Egeria database so that the next
+    'survey --publish' re-registers each project from scratch.
+
+    Examples:
+      project-explorer egeria-reset egeria
+      project-explorer egeria-reset egeria beeai_framework
+      project-explorer egeria-reset --all
+    """
+    from explorer.registry import ProjectRegistry
+
+    registry = ProjectRegistry()
+
+    if all_projects:
+        targets = [p.slug for p in registry.list()]
+    elif slugs:
+        targets = list(slugs)
+    else:
+        console.print("[red]Provide one or more project slugs, or use --all.[/red]")
+        raise typer.Exit(1)
+
+    if not targets:
+        console.print("[yellow]No registered projects found.[/yellow]")
+        raise typer.Exit(0)
+
+    from rich.table import Table
+    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+    table.add_column("Project", min_width=20)
+    table.add_column("GUID cleared", justify="center", min_width=13)
+    table.add_column("Survey records deleted", justify="right", min_width=22)
+
+    for slug in targets:
+        if not registry.exists(slug):
+            console.print(f"[yellow]Project '{slug}' not found — skipping.[/yellow]")
+            continue
+        result = registry.clear_egeria_registration(slug)
+        guid_str = "[green]yes[/green]" if result["asset_guid_cleared"] else "[dim]none[/dim]"
+        table.add_row(slug, guid_str, str(result["surveys_deleted"]))
+
+    console.print(table)
+    console.print(
+        "\n[dim]Run [bold]project-explorer survey <slug> --publish[/bold] "
+        "to re-register and publish a fresh survey.[/dim]"
+    )
+
+
 @app.command(name="egeria-reports")
 def egeria_reports(
     slug: str = typer.Argument(help="Project slug"),

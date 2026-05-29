@@ -105,8 +105,16 @@ async def commits_chart(slug: str) -> dict:
 async def languages_chart(slug: str) -> dict:
     """Return Plotly figure JSON for the language-breakdown pie chart."""
     from explorer.dashboard.graphs import language_breakdown_plotly
+    from fastapi import HTTPException
     fig = language_breakdown_plotly(slug)
-    return json.loads(fig.to_json())
+    fig_dict = json.loads(fig.to_json())
+    # Return 404 when the pie has no slices so the UI shows "No data" instead of a blank chart
+    if not fig_dict.get("data") or not fig_dict["data"][0].get("labels"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No language data for '{slug}' — run 'project-explorer refresh {slug}' first",
+        )
+    return fig_dict
 
 
 @router.get("/{slug}/charts/top_committers")

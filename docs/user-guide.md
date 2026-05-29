@@ -128,7 +128,8 @@ The web UI provides:
 - **Streaming responses** — assistant text appears token-by-token via server-sent events (SSE); no waiting for the full answer
 - **Conversation memory** — a UUID session ID is stored in `localStorage` and sent with every request; the server maintains a persistent `ConversationAgent` per session (30-minute idle timeout), giving the web UI the same cross-turn memory as the TUI and CLI
 - **Inline charts** — when a statistical or health query warrants a chart, a Plotly figure appears directly in the chat response alongside the text
-- **Inline symbol tables** — when a code inventory query ("how many classes?", "list all functions") is answered, a sortable table of symbols appears below the response; sortable by name, kind, or file
+- **Inline symbol tables** — when a code inventory query ("how many classes?", "list all functions") is answered, a sortable, searchable table of symbols appears below the response; type in the filter box to narrow by name or file; click column headers to sort
+- **API surface comparison** — when a comparison query mentions classes, methods, or API surface ("compare the public API of A vs B"), a side-by-side panel shows per-kind symbol counts and top symbols for each project
 - **Survey Report tab** — click "📊 Survey Report" in the top nav when a project is selected. Shows health metric cards, a file type donut chart, a dependency bar chart, and a **Data Files** section with column schemas, row counts, and null rates for profiled CSV/Excel/Parquet files. When data files are detected but no profiles exist yet, a hint appears with the exact `refresh` command to run. Select file type rows and click **"Catalog selected →"** to create Egeria `DataSet` assets.
 - **Sidebar charts** — Plotly interactive charts (Stars, Commits, Languages, Health) per selected project; click chart tabs to switch. The Commits tab shows the last 13 weeks of actual commit activity from the `project_commits` table, not snapshot aggregates
 - **👍/👎 feedback buttons** — on each assistant message; keyboard `f` key also opens feedback
@@ -223,28 +224,274 @@ Statistical, health, and code-inventory queries never touch Milvus — they read
 
 ---
 
-## Contributor and Commit Queries
+## Question Reference
 
-After indexing, you can ask contributor-specific questions:
+This section catalogs the kinds of questions the system can answer, organized by the type of information you're looking for. Each type maps to a specialized agent that knows exactly where to look.
+
+You don't need to phrase questions exactly as shown — the intent classifier uses regex patterns, so natural variations work. The examples below are meant to illustrate the range, not to be memorized.
+
+---
+
+### GitHub Statistics and Activity
+
+**Agent:** StatsAgent — reads from SQLite (`project_stats`, `project_commits`). Never touches Milvus.
+
+```
+"How many stars does this project have?"
+"What's the fork count for egeria?"
+"How many contributors does Unity Catalog have?"
+"How many commits were made in the last 30 days?"
+"How many commits in the last 90 days?"
+"Show me commit activity over time"
+"Graph commits per week"
+"Show the weekly commit trend for the last 13 weeks"
+"When was the last commit?"
+"How much code was added vs deleted this month?"
+"What's the release cadence?"
+"How many open issues are there?"
+```
+
+The "graph commits per week" query automatically renders a bar chart inline in the chat response (web UI) or prints an ASCII sparkline (CLI). The chart shows the last 13 weeks of actual commit timestamps — not an aggregate.
+
+---
+
+### Contributors and Committers
+
+**Agent:** StatsAgent — reads from `project_commits` and `project_contributor_stats`.
 
 ```
 "Who are the top committers to this project?"
 "Who has contributed the most in the last 90 days?"
+"Show me the top 5 contributors"
 "Tell me about Alice's contributions"
-"Show me the commit activity trend"
-"Graph commits per week"
-"How much code has been added vs deleted this month?"
-"When was the last commit?"
+"What is Bob's commit tier?"
+"Who is driving the most code change?"
+"Which contributors are in the core tier?"
+"Show me the committer breakdown"
 ```
 
-Commit counts are read from the `project_commits` table populated during `add` and `refresh`. This table holds the full per-commit history for the last 90 days and is the authoritative source for all count and trend queries. The "graph commits per week" query will automatically render a bar chart showing weekly activity for the last 13 weeks.
-
-**Contributor profiles** — after `refresh`, per-commit additions and deletions are stored alongside commit metadata. This enables questions like "who is driving the most code change?" and returns a profile with:
+After `refresh`, per-commit additions and deletions are stored alongside commit metadata. Contributor profiles include:
 - Commit count and comparison to the project average
 - Lines added and deleted
-- Activity tier: `core` (top 25%), `regular` (25th–75th percentile), or `occasional` (below 25th)
+- Activity tier: `core` (top 25% by commits), `regular` (25th–75th percentile), or `occasional` (below 25th)
 
-**Code churn** — the weekly activity chart includes `(+adds / -dels)` per week when churn data is available. Run `refresh` to populate churn data for existing projects.
+The weekly activity chart includes `(+adds / -dels)` annotations per week when churn data is available. Run `refresh` to populate churn data for projects indexed before this feature was added.
+
+---
+
+### Project Health and Maintenance
+
+**Agent:** HealthAgent — scores from `project_stats`; no Milvus.
+
+```
+"Is this project actively maintained?"
+"What's the health score for beeai_framework?"
+"What's the bus factor?"
+"How active is the community?"
+"Is this a risky dependency?"
+"When was the last release?"
+"How regular are the releases?"
+"Is the commit activity declining?"
+"How responsive are the maintainers?"
+```
+
+Health queries return a structured score across four dimensions: **Activity** (commit frequency), **Community** (contributor count and spread), **Release Cadence** (regularity of tagged releases), and **Freshness** (how recently the project was updated). A radar chart is rendered inline in the web UI.
+
+---
+
+### Code Structure and Inventory
+
+**Agent:** CodeAgent — reads from `project_code_symbols` SQLite table. No vector search.
+
+This intent handles structural questions that have precise, countable answers. The agent queries the symbol table extracted at ingest time — it does not guess or approximate.
+
+```
+"How many classes does egeria have?"
+"How many functions are in the ingestion module?"
+"List all classes in explorer/agents/"
+"What methods does CodeParser have?"
+"Show me all public interfaces"
+"Show me the signature of the parse method"
+"What does the query_project_stats function return?"
+"List all enums in the codebase"
+"How many methods does the IngestionPipeline class have?"
+"Show the API surface for the registry module"
+"Which classes are defined in registry.py?"
+"What's the signature of BaseExplorerAgent.__init__?"
+```
+
+In the web UI, code inventory answers include a **sortable, searchable symbol table** below the response. Click any column header to sort; type in the filter box to narrow results by name, kind, or file. For comparison queries that mention API surface (e.g., "compare the classes in project A vs B"), a side-by-side panel shows per-kind counts for both projects.
+
+Symbol data is populated automatically during `add` and `refresh`. For projects indexed before code intelligence was added, run a one-time backfill:
+
+```bash
+project-explorer refresh <slug> --symbols --no-stats
+```
+
+---
+
+### Code Search and Implementation
+
+**Agent:** CodeAgent — vector search over code collections (`python_code`, `javascript_code`, `java_code`, `go_code`).
+
+This intent handles semantic questions about *how* something is implemented — where to find a pattern, what a piece of code does, how a module is structured.
+
+```
+"How is authentication implemented?"
+"Where is the retry logic?"
+"How does the ingestion pipeline handle large files?"
+"Show me the database connection setup"
+"Where are environment variables read?"
+"How does the caching layer work?"
+"Find all places that call the GitHub API"
+"What does the DataPrep class do?"
+"How is error handling done in the web routes?"
+"Show me the embedding logic"
+"Where is rate limiting enforced?"
+"How is the LLM backend selected?"
+```
+
+---
+
+### Runnable Code Examples
+
+**Agent:** ExamplesAgent — retrieves from `examples`, `python_code`, `api_reference`, and `markdown_docs` collections, then generates a complete, runnable Python snippet.
+
+```
+"Show me an example of adding a project"
+"Give me a Python example of querying the vector store"
+"How do I use the BeeAI @tool decorator?"
+"Write an example that indexes a repo and asks a question"
+"Show me how to use the LLM client"
+"Give me an example of creating a custom agent"
+"Show me example code for connecting to Milvus"
+"How do I call the streaming endpoint from Python?"
+```
+
+Examples are generated from actual indexed code, not hallucinated. Constructor signatures and import paths are extracted from the `api_reference` and `examples` collections so the generated code is accurate for the indexed version of the project.
+
+---
+
+### Documentation and Architecture
+
+**Agent:** DocAgent — vector search over `markdown_docs`, `web_docs`, `api_reference`, `pdfs`, `release_notes` collections.
+
+```
+"How does the routing work?"
+"Explain the architecture"
+"What is the query flow?"
+"How does incremental indexing work?"
+"What's documented in the README?"
+"How is the TUI structured?"
+"What are the configuration options?"
+"Explain the collection namespace model"
+"What changed in the last release?"
+"What was added in version 2.0?"
+"How do I configure Redis caching?"
+"What does the onboarding wizard do?"
+"What data formats does the data profiler support?"
+```
+
+---
+
+### Data Files and Profiling
+
+**Agent:** General RAG / DocAgent — reads from survey data stored in SQLite (`project_data_profiles`, `project_file_type_counts`).
+
+These questions work after running `survey` or `refresh` (which profiles data files during ingest).
+
+```
+"What data files are in this project?"
+"How many rows does train.csv have?"
+"What columns are in the main dataset?"
+"Which columns have high null rates?"
+"What's the schema of the Parquet files?"
+"How large is the data directory?"
+"What data formats does this project use?"
+"Are there any CSV files larger than 50 MB?"
+"Summarize the dataset structure"
+```
+
+The **Survey Report tab** in the web UI also shows this information visually — per-file cards with format, size, row × column count, column type pills, and null rate warnings. You can catalog selected file types as Egeria `DataSet` assets directly from the tab.
+
+---
+
+### Project Comparison
+
+**Agent:** CompareAgent — multi-project vector search plus `project_stats` for both projects.
+
+In the web UI, Shift+click a second project to enter compare mode — queries are automatically sent to CompareAgent. In the CLI, mention both project names in your question.
+
+```
+"Compare project A and project B"
+"Which has more stars, egeria or beeai_framework?"
+"How does the architecture of A differ from B?"
+"Compare the documentation quality of these two projects"
+"Which project is more actively maintained?"
+"Show me side-by-side commit activity for A and B"
+"What's the difference in contributor count?"
+"Compare the dependency footprint of A vs B"
+"How similar are the APIs of A and B?"
+"Compare the classes in egeria vs unity-catalog"
+"Which project has more public methods?"
+"Show me the API surface diff between these two"
+```
+
+When a comparison question mentions code structure (classes, methods, API surface, public symbols), the web UI renders a **side-by-side API surface panel** below the response — showing per-kind symbol counts and top symbols for each project.
+
+---
+
+### Integration Questions
+
+**Agent:** IntegrationAgent — asks how two or more projects work together; combines context from both.
+
+```
+"Can I use egeria with agentstack?"
+"How does beeai_framework integrate with Milvus?"
+"Can I swap out Ollama for OpenAI in this stack?"
+"How would I use project A as a backend for project B?"
+"What would I need to connect these two systems?"
+"Is there overlap between A and B?"
+"How do A and B complement each other?"
+"What's the migration path from A to B?"
+```
+
+---
+
+### Multi-Turn Follow-Up Questions
+
+The conversation agent maintains memory across turns in all interfaces — CLI `chat`, TUI, and web UI. You can ask follow-up questions that refer back to previous answers without repeating context.
+
+```
+# First question
+"Who are the top committers to egeria?"
+
+# Follow-ups — the agent remembers the project and the answer
+"Tell me more about the top one"
+"How does their contribution compare to the team average?"
+"When did they join the project?"
+
+# Or pivot topic without re-specifying the project
+"Now show me the commit trend"
+"What's the health score?"
+"How many classes are in the codebase?"
+```
+
+In the web UI, session memory persists for 30 minutes of idle time. If you close the tab and return within that window, conversation context is restored from the server.
+
+---
+
+### Tips for Better Answers
+
+**Be specific about what you want:** "How many Python classes are in the ingestion module?" gets a faster, more accurate answer than "Tell me about the code" because it routes directly to the symbol table rather than triggering a vector search.
+
+**Scope your question when you know the project:** Add the project name or use `--project <slug>` to skip project inference. This is especially important when multiple indexed projects have overlapping terminology.
+
+**Ask for charts explicitly in the web UI:** Phrases like "graph commits per week", "show me a chart of stars over time", or "visualize the language breakdown" trigger inline Plotly charts alongside the text response.
+
+**Use natural follow-ups:** After any answer, you can ask "Can you show that as a chart?", "Which file is that in?", "Give me an example of using that function", or "What changed in the latest release?" — the agent keeps context across turns.
+
+**If the answer seems wrong:** Run `project-explorer refresh <slug>` to update the index, then re-ask. Stats and code-inventory answers are only as fresh as the last refresh.
 
 ---
 
@@ -506,6 +753,52 @@ ANTHROPIC_API_KEY=sk-ant-...
 LLM__ANTHROPIC__MODEL=claude-haiku-4-5-20251001
 ```
 
+### Choosing a Model
+
+The system uses multi-tool agents (BeeAI `RequirementAgent`) that must follow precise instructions about which tool to call. **Tool-use compliance varies significantly by model size and family** — this is the most important factor in answer quality.
+
+#### Ollama (local, no API cost)
+
+| Model | Size | Tool-use | Notes |
+|---|---|---|---|
+| `llama3.1:8b` | 4.9 GB | Fair | Default; occasionally ignores tool-selection rules on complex queries |
+| `qwen2.5-coder:latest` | 4.7 GB | Good | Code-specialized; better instruction following for code queries |
+| `granite3.3:8b` | 4.9 GB | Good | IBM model; reliable instruction following |
+| `mistral:7b` | 4.4 GB | Fair | General purpose; similar to llama3.1:8b |
+| `codellama:13b` | 7.4 GB | Fair | Better at code retrieval but slower |
+
+To switch models, change one line in `.env`:
+
+```bash
+LLM__OLLAMA__MODEL=qwen2.5-coder:latest
+```
+
+#### API backends (best quality, usage cost)
+
+API-hosted models are trained specifically for tool use and follow system prompt instructions much more reliably than local 8B models. If you see the agent picking the wrong tool, calling `query_code_symbols` for implementation questions, or producing hallucinated summaries ("listed above" with nothing listed), switching to an API backend will resolve it.
+
+```bash
+# Anthropic — best tool-use compliance; Haiku is fast and cheap
+LLM__BACKEND=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+LLM__ANTHROPIC__MODEL=claude-haiku-4-5-20251001   # fast, low cost
+# LLM__ANTHROPIC__MODEL=claude-sonnet-4-6          # higher quality
+
+# OpenAI
+LLM__BACKEND=openai
+OPENAI_API_KEY=sk-...
+LLM__OPENAI__MODEL=gpt-4o-mini    # fast, low cost
+# LLM__OPENAI__MODEL=gpt-4o       # higher quality
+```
+
+#### Symptoms of poor tool-use compliance
+
+If you see these, try a different model:
+- Agent answers "The top N symbols are listed above" but shows nothing — model called `query_code_symbols` for a semantic question and couldn't fit the result in context
+- "How is X implemented?" returns a symbol count instead of explaining the code — model ignored tool-selection rules
+- Agent asks for clarification on every question even when the project is selected — model isn't reading the system prompt reliably
+- Responses trail off mid-sentence or repeat themselves — context window filling up from oversized tool results
+
 ### Milvus
 
 ```bash
@@ -572,28 +865,43 @@ project-explorer list
 project-explorer ask --project ml-llm-ops "How many stars does this project have?"
 project-explorer ask --project ml-llm-ops "Who are the top committers in the last 90 days?"
 project-explorer ask --project ml-llm-ops "Is this project actively maintained?"
+project-explorer ask --project ml-llm-ops "How many Python classes are in this project?"
+project-explorer ask --project ml-llm-ops "What's the signature of the main pipeline function?"
 project-explorer ask --project ml-llm-ops "How does the ML pipeline work?"
 project-explorer ask --project ml-llm-ops "Where is the MLflow tracking configured?"
+project-explorer ask --project ml-llm-ops "Show me an example of running the pipeline"
 
 # 5. Test project inference (no --project flag)
 project-explorer ask "How many stars does ML LLM Ops have?"
 
-# 6. Interactive CLI session (with cross-turn memory)
+# 6. Test multi-turn memory (CLI)
 project-explorer chat --project ml-llm-ops
+# Inside the session:
+# > Who are the top committers?
+# > Tell me more about the top one
+# > What's the commit trend for the last 13 weeks?
+# > Now show me the architecture
 
-# 7. Full-screen TUI (streaming + memory)
+# 7. Run survey (generates annotation report from SQLite — no Egeria needed)
+project-explorer survey ml-llm-ops
+
+# 8. Full-screen TUI (streaming + memory)
 project-explorer tui
 
-# 8. Web UI (streaming + session memory + inline charts)
+# 9. Web UI (streaming + session memory + inline charts + symbol tables)
 project-explorer web
-# Then open http://127.0.0.1:8000 and try the same questions
-# Ask "graph commits per week for ml-llm-ops" to see an inline chart in the response
+# Open http://127.0.0.1:8000 and try:
+# - "graph commits per week for ml-llm-ops"   → inline Plotly bar chart
+# - "how many classes does ml-llm-ops have?"  → inline sortable/searchable symbol table
+# - "who are the top committers?"             → inline bar chart (after selecting project)
+# - Select the project, click "📊 Survey Report" to see file types and data profiles
 ```
 
 Expected behavior:
 - Stars/contributor questions return data from the stats database without Milvus lookup
+- Code inventory questions ("how many classes?") return structured counts from the symbol table, with a searchable table in the web UI
 - Architecture/pipeline questions retrieve from markdown collections
-- Code questions retrieve from Python code collections
+- Code search questions retrieve from Python code collections
 - Project inference works when the project name appears in the query
 - When no project can be inferred, the agent asks for clarification
 - In the web UI, follow-up questions remember prior context (e.g., "tell me more about the top committer" after asking who they are)
@@ -605,6 +913,9 @@ Expected behavior:
 
 **"No collections found for this project"**
 The ingestion may have found no files matching a collection's extensions. Run `refresh` or re-add with different collection selections.
+
+**Agent returns "The top N symbols are listed above" but shows no symbols, or answers "How is X implemented?" with a symbol count**
+The agent called `query_code_symbols` (a structural listing tool) instead of `vector_search` (semantic code retrieval). This is a tool-use compliance failure in the underlying LLM. Workaround: rephrase the question to be more explicit — "Show me the code that handles X" or "Where is the X logic implemented?" tends to route correctly. Permanent fix: switch to a model with better instruction following — see [Choosing a Model](#choosing-a-model).
 
 **"I don't have enough information..."**
 The retrieval score fell below 0.30 (the minimum). The query may be outside the indexed content, or the project needs a refresh.

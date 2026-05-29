@@ -117,14 +117,35 @@ class EgeriaPublisher:
         Checks the registry cache first to avoid an unnecessary search call on
         repeated --publish runs. Creates the asset when not already registered.
         """
-        # Check local cache first
+        qualified_name = f"SourceControlLibrary::{result.github_url}"
+
+        # Check local cache first, but verify the GUID still exists in Egeria.
+        # If the Egeria database was reset, the cached GUID is stale — clear it
+        # and fall through to the search/create path rather than failing later.
         if self._registry:
             cached = self._registry.get_egeria_asset_guid(result.project_slug)
             if cached:
-                log.info("Using cached Egeria asset GUID %s for %s", cached, result.project_slug)
-                return cached
-
-        qualified_name = f"SourceControlLibrary::{result.github_url}"
+                try:
+                    check = self._asset_maker.find_software_capabilities(
+                        search_string=qualified_name,
+                        starts_with=True,
+                        ignore_case=False,
+                        output_format="JSON",
+                    )
+                    if isinstance(check, list) and any(
+                        e.get("elementHeader", {}).get("guid") == cached for e in check
+                    ):
+                        log.info("Using cached Egeria asset GUID %s for %s", cached, result.project_slug)
+                        return cached
+                    # GUID not found — Egeria DB may have been reset; clear the stale cache
+                    log.warning(
+                        "Cached GUID %s no longer in Egeria for %s — will re-register",
+                        cached, result.project_slug,
+                    )
+                    self._registry.clear_egeria_registration(result.project_slug)
+                except Exception as exc:
+                    log.debug("Cache verification failed (will proceed): %s", exc)
+                    return cached  # network error — trust the cache rather than re-create
 
         # Search Egeria for an existing asset with this qualifiedName
         try:

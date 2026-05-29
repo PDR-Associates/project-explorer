@@ -730,6 +730,26 @@ class ProjectRegistry:
                 (guid, slug),
             )
 
+    def clear_egeria_registration(self, slug: str) -> dict:
+        """Clear the cached Egeria GUID and all published survey records for a project.
+
+        Returns {"asset_guid_cleared": bool, "surveys_deleted": int} so callers
+        can report what was removed.  Safe to call when the project is not registered.
+        """
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT egeria_asset_guid FROM projects WHERE slug = ?", (slug,)
+            ).fetchone()
+            had_guid = bool(row and row["egeria_asset_guid"])
+            conn.execute(
+                "UPDATE projects SET egeria_asset_guid = NULL WHERE slug = ?", (slug,)
+            )
+            deleted = conn.execute(
+                "DELETE FROM project_egeria_surveys WHERE project_slug = ?", (slug,)
+            ).rowcount
+        return {"asset_guid_cleared": had_guid, "surveys_deleted": deleted}
+
     def record_egeria_survey(
         self,
         slug: str,
