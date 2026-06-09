@@ -1,0 +1,37 @@
+ 2026-06-05 11:27:31 | WARNING | load_compact_specs_from_dir:145 - Command 'Create Report Type' in commands_data_designer.json overwrites a definition from a previous file.-{}
+ 2026-06-05 11:27:39 | INFO | __init__:260 - 
+
+=> 	CLIENT_ERROR_400
+=>	Client error occurred with status code `https://localhost:9443/api/about`.
+	* Context: 
+		* class name=`BaseServerClient`
+		* caller method=`async_get_platform_origin`
+	* System Action: The client is unable to connect to the Egeria platform.
+	* User Action: Check the URL to ensure the valid platform url, server, user id are correct.
+	* HTTP Code: 401
+-{'ip': URL('https://localhost:9443/api/about'), 'http_code': 401, 'pyegeria_code': 'CLIENT_ERROR_400'}
+ 2026-06-05 11:29:13 | WARNING | load_compact_specs_from_dir:145 - Command 'Create Report Type' in commands_data_designer.json overwrites a definition from a previous file.-{}
+ 2026-06-05 11:29:25 | WARNING | load_compact_specs_from_dir:145 - Command 'Create Report Type' in commands_data_designer.json overwrites a definition from a previous file.-{}
+ 2026-06-05 11:29:31 | INFO | __init__:260 - 
+
+=> 	CLIENT_ERROR_400
+=>	Client error occurred with status code `https://localhost:9443/api/about`.
+	* Context: 
+		* class name=`BaseServerClient`
+		* caller method=`async_get_platform_origin`
+	* System Action: The client is unable to connect to the Egeria platform.
+	* User Action: Check the URL to ensure the valid platform url, server, user id are correct.
+	* HTTP Code: 401
+-{'ip': URL('https://localhost:9443/api/about'), 'http_code': 401, 'pyegeria_code': 'CLIENT_ERROR_400'}
+ 2026-06-05 12:26:22 | WARNING | load_compact_specs_from_dir:145 - Command 'Create Report Type' in commands_data_designer.json overwrites a definition from a previous file.-{}
+ 2026-06-05 12:26:30 | INFO | __init__:260 - 
+
+=> 	CLIENT_ERROR_400
+=>	Client error occurred with status code `https://localhost:9443/api/about`.
+	* Context: 
+		* class name=`BaseServerClient`
+		* caller method=`async_get_platform_origin`
+	* System Action: The client is unable to connect to the Egeria platform.
+	* User Action: Check the URL to ensure the valid platform url, server, user id are correct.
+	* HTTP Code: 401
+-{'ip': URL('https://localhost:9443/api/about'), 'http_code': 401, 'pyegeria_code': 'CLIENT_ERROR_400'}

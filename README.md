@@ -1,23 +1,69 @@
 # Project Explorer
 
-A production-quality multi-agent RAG reference implementation for exploring and understanding GitHub repositories through natural language.
+A production-quality multi-agent RAG reference implementation for exploring and understanding **GitHub repositories** and **databases** through natural language.
 
 Built on open-source components from the LF AI & Data Foundation ecosystem.
 
+## Installation & Usage
+
+### With uv (Recommended)
+
+```bash
+# Sync dependencies (from project root)
+uv sync
+
+# Run commands with uv run
+uv run python -m explorer.cli.main database list
+uv run python -m explorer.cli.main database register my-db postgresql localhost 5432 mydb
+uv run python -m explorer.cli.main web
+```
+
+### With pip (Alternative)
+
+```bash
+# Install in editable mode
+pip install -e .
+
+# Then use the command directly
+project-explorer database list
+project-explorer web
+```
+
 ## What it does
 
-Point it at any GitHub repository and ask questions in plain English:
+Point it at any GitHub repository or database and ask questions in plain English:
 
-```
+### GitHub Repositories
+```bash
+# With uv
+uv run python -m explorer.cli.main add https://github.com/apache/arrow
+uv run python -m explorer.cli.main ask --project arrow "How does the Flight RPC protocol work?"
+uv run python -m explorer.cli.main chat --project arrow
+uv run python -m explorer.cli.main web
+
+# With pip install
 project-explorer add https://github.com/apache/arrow
 project-explorer ask --project arrow "How does the Flight RPC protocol work?"
-project-explorer ask --project arrow "Who are the most active contributors in the last 90 days?"
-project-explorer chat --project arrow
-project-explorer web   # browser UI with Plotly charts and markdown rendering
-project-explorer survey --project arrow   # Egeria-aligned analysis: file types, health, security, deps
+project-explorer survey --project arrow
 ```
 
-It classifies your question, routes it to the right agent (code search, documentation, statistics, health), retrieves relevant context from Milvus, and synthesizes an answer with an LLM.
+### Databases (NEW!)
+```bash
+# With uv
+uv run python -m explorer.cli.main database register my-postgres postgresql localhost 5432 mydb
+uv run python -m explorer.cli.main database survey my-postgres --egeria
+uv run python -m explorer.cli.main database list
+uv run python -m explorer.cli.main database info my-postgres
+
+# With pip install
+project-explorer database register my-postgres postgresql localhost 5432 mydb
+project-explorer database survey my-postgres --egeria
+project-explorer database list
+```
+
+**Note**: The `project-explorer` command is only available after `pip install -e .`. With `uv`, use `uv run python -m explorer.cli.main` instead.
+
+It classifies your question, routes it to the right agent (code search, documentation, statistics, health, database schema), retrieves relevant context from Milvus, and synthesizes an answer with an LLM.
 
 ---
 

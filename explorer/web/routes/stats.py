@@ -170,6 +170,127 @@ async def health_chart(slug: str) -> dict:
     return json.loads(fig.to_json())
 
 
+# ── database charts ───────────────────────────────────────────────────────────
+
+@router.get("/databases/{slug}/schema_distribution")
+async def database_schema_distribution(slug: str) -> dict:
+    """Return schema size distribution for a database."""
+    registry = ProjectRegistry()
+    database = registry.get_database(slug)
+    if not database:
+        raise HTTPException(status_code=404, detail=f"Database '{slug}' not found")
+    
+    surveys = registry.get_database_surveys(slug)
+    if not surveys:
+        raise HTTPException(status_code=404, detail=f"No surveys for '{slug}' — run survey first")
+    
+    latest = surveys[0]
+    survey_data = json.loads(latest.get("survey_data", "{}"))
+    schemas = survey_data.get("schemas", [])
+    
+    if not schemas:
+        return {"schemas": [], "table_counts": [], "sizes": []}
+    
+    return {
+        "schemas": [s["name"] for s in schemas],
+        "table_counts": [s.get("table_count", 0) for s in schemas],
+        "column_counts": [s.get("column_count", 0) for s in schemas],
+    }
+
+
+@router.get("/databases/{slug}/table_sizes")
+async def database_table_sizes(slug: str, limit: int = 20) -> dict:
+    """Return top N tables by row count."""
+    registry = ProjectRegistry()
+    database = registry.get_database(slug)
+    if not database:
+        raise HTTPException(status_code=404, detail=f"Database '{slug}' not found")
+    
+    surveys = registry.get_database_surveys(slug)
+    if not surveys:
+        raise HTTPException(status_code=404, detail=f"No surveys for '{slug}' — run survey first")
+    
+    latest = surveys[0]
+    survey_data = json.loads(latest.get("survey_data", "{}"))
+    
+    # Collect all tables from all schemas
+    all_tables = []
+    for schema in survey_data.get("schemas", []):
+        for table in schema.get("tables", []):
+            all_tables.append({
+                "schema": schema["name"],
+                "table": table["name"],
+                "rows": table.get("row_count", 0),
+                "size_mb": table.get("size_mb", 0),
+            })
+    
+    # Sort by row count and take top N
+    all_tables.sort(key=lambda t: t["rows"], reverse=True)
+    top_tables = all_tables[:limit]
+    
+    return {
+        "tables": [f"{t['schema']}.{t['table']}" for t in top_tables],
+        "row_counts": [t["rows"] for t in top_tables],
+        "sizes_mb": [t["size_mb"] for t in top_tables],
+    }
+
+
+@router.get("/databases/{slug}/column_types")
+async def database_column_types(slug: str) -> dict:
+    """Return distribution of column data types."""
+    registry = ProjectRegistry()
+    database = registry.get_database(slug)
+    if not database:
+        raise HTTPException(status_code=404, detail=f"Database '{slug}' not found")
+    
+    surveys = registry.get_database_surveys(slug)
+    if not surveys:
+        raise HTTPException(status_code=404, detail=f"No surveys for '{slug}' — run survey first")
+    
+    latest = surveys[0]
+    survey_data = json.loads(latest.get("survey_data", "{}"))
+    
+    # Count column types across all schemas and tables
+    type_counts = {}
+    for schema in survey_data.get("schemas", []):
+        for table in schema.get("tables", []):
+            for column in table.get("columns", []):
+                col_type = column.get("data_type", "unknown")
+                type_counts[col_type] = type_counts.get(col_type, 0) + 1
+    
+    # Sort by count
+    sorted_types = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
+    
+    return {
+        "types": [t[0] for t in sorted_types],
+        "counts": [t[1] for t in sorted_types],
+    }
+
+
+@router.get("/databases/{slug}/survey_history")
+async def database_survey_history(slug: str, limit: int = 30) -> dict:
+    """Return survey history timeline."""
+    registry = ProjectRegistry()
+    database = registry.get_database(slug)
+    if not database:
+        raise HTTPException(status_code=404, detail=f"Database '{slug}' not found")
+    
+    surveys = registry.get_database_surveys(slug)
+    if not surveys:
+        return {"dates": [], "schema_counts": [], "table_counts": [], "column_counts": []}
+    
+    # Take most recent N surveys
+    recent = surveys[:limit]
+    recent.reverse()  # Oldest first for timeline
+    
+    return {
+        "dates": [s.get("surveyed_at", "")[:10] for s in recent],
+        "schema_counts": [s.get("schema_count", 0) for s in recent],
+        "table_counts": [s.get("table_count", 0) for s in recent],
+        "column_counts": [s.get("column_count", 0) for s in recent],
+    }
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _latest_stats(db_path: str, slug: str) -> dict:

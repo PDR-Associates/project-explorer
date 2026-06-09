@@ -69,6 +69,7 @@ def _persist_turn(session_id: str, query: str, response: str, project_slug: str 
 class QueryRequest(BaseModel):
     query: str
     project_slug: str | None = None
+    database_slug: str | None = None  # NEW: for database-scoped queries
     session_id: str | None = None  # browser-generated UUID for cross-turn memory
 
 
