@@ -186,15 +186,15 @@ async def database_schema_distribution(slug: str) -> dict:
     
     latest = surveys[0]
     survey_data = json.loads(latest.get("survey_data", "{}"))
-    schemas = survey_data.get("schemas", [])
-    
+    schemas = survey_data.get("schema_info", {}).get("schemas", [])
+
     if not schemas:
-        return {"schemas": [], "table_counts": [], "sizes": []}
-    
+        return {"schemas": [], "table_counts": [], "column_counts": []}
+
     return {
         "schemas": [s["name"] for s in schemas],
-        "table_counts": [s.get("table_count", 0) for s in schemas],
-        "column_counts": [s.get("column_count", 0) for s in schemas],
+        "table_counts": [len(s.get("tables", [])) for s in schemas],
+        "column_counts": [sum(len(t.get("columns", [])) for t in s.get("tables", [])) for s in schemas],
     }
 
 
@@ -212,22 +212,36 @@ async def database_table_sizes(slug: str, limit: int = 20) -> dict:
     
     latest = surveys[0]
     survey_data = json.loads(latest.get("survey_data", "{}"))
-    
-    # Collect all tables from all schemas
+
+    # schema_info.schemas has table/column names; statistics.table_stats has sizes
+    schemas = survey_data.get("schema_info", {}).get("schemas", [])
+    # Build a size lookup from statistics: {schema.table -> {total_bytes, total_size}}
+    stat_lookup: dict[str, dict] = {}
+    for ts in survey_data.get("statistics", {}).get("table_stats", []):
+        key = f"{ts.get('schemaname', '')}.{ts.get('tablename', '')}"
+        stat_lookup[key] = ts
+
     all_tables = []
-    for schema in survey_data.get("schemas", []):
+    for schema in schemas:
         for table in schema.get("tables", []):
+            key = f"{schema['name']}.{table['name']}"
+            ts = stat_lookup.get(key, {})
+            size_bytes = table.get("size_bytes") or ts.get("total_bytes", 0) or 0
+            row_count  = table.get("row_count", 0)
             all_tables.append({
                 "schema": schema["name"],
                 "table": table["name"],
-                "rows": table.get("row_count", 0),
-                "size_mb": table.get("size_mb", 0),
+                "rows": row_count,
+                "size_mb": round(size_bytes / 1_048_576, 2) if size_bytes else 0,
             })
-    
-    # Sort by row count and take top N
-    all_tables.sort(key=lambda t: t["rows"], reverse=True)
+
+    # Sort by row count; fall back to size when all rows are 0
+    all_tables.sort(
+        key=lambda t: (t["rows"], t["size_mb"]),
+        reverse=True,
+    )
     top_tables = all_tables[:limit]
-    
+
     return {
         "tables": [f"{t['schema']}.{t['table']}" for t in top_tables],
         "row_counts": [t["rows"] for t in top_tables],
@@ -251,11 +265,12 @@ async def database_column_types(slug: str) -> dict:
     survey_data = json.loads(latest.get("survey_data", "{}"))
     
     # Count column types across all schemas and tables
-    type_counts = {}
-    for schema in survey_data.get("schemas", []):
+    # connection.py stores field as "type"; fall back to "data_type" for safety
+    type_counts: dict[str, int] = {}
+    for schema in survey_data.get("schema_info", {}).get("schemas", []):
         for table in schema.get("tables", []):
             for column in table.get("columns", []):
-                col_type = column.get("data_type", "unknown")
+                col_type = column.get("type") or column.get("data_type") or "unknown"
                 type_counts[col_type] = type_counts.get(col_type, 0) + 1
     
     # Sort by count

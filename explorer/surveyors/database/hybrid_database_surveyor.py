@@ -117,7 +117,7 @@ class HybridDatabaseSurveyor:
 
         # Execute survey
         if use_egeria:
-            return self._run_egeria_survey(db_entity, secrets_path)
+            return self._run_egeria_survey(db_entity, secrets_path, credentials)
         else:
             return self._run_custom_survey(db_entity, credentials)
 
@@ -125,39 +125,53 @@ class HybridDatabaseSurveyor:
         self,
         db_entity: DatabaseEntity,
         secrets_path: str | None,
+        credentials: dict | None = None,
     ) -> dict:
-        """Run survey using Egeria's native capabilities."""
+        """Trigger an Egeria native survey then also run a local custom scan for immediate results."""
+        # Resolve DB credentials: prefer explicit credentials, fall back to stored on entity.
+        db_user = (credentials or {}).get("user") or getattr(db_entity, "db_user", "")
+        db_pwd  = (credentials or {}).get("password") or getattr(db_entity, "db_password", "")
+
+        engine_action_guid = ""
         try:
             egeria_surveyor = self._get_egeria_surveyor()
-            
-            # Trigger survey
-            log.info(f"Triggering Egeria survey for {db_entity.slug}")
-            engine_action_guid = egeria_surveyor.trigger_postgresql_survey(
-                db_entity,
-                secrets_path=secrets_path,
+            log.info(f"Cataloging + triggering Egeria survey for {db_entity.slug}")
+            egeria_result = egeria_surveyor.catalog_and_survey(
+                db_entity=db_entity,
+                db_user=db_user,
+                db_pwd=db_pwd,
+                registry=self.registry,
+                survey_after_catalog=True,
             )
-            
-            # Note: In a production system, we would monitor the engine action
-            # and wait for completion. For now, we return a pending status.
-            return {
-                "source": "egeria",
-                "database_slug": db_entity.slug,
-                "surveyed_at": datetime.utcnow().isoformat(),
-                "status": "pending",
-                "engine_action_guid": engine_action_guid,
-                "message": (
-                    "Egeria survey triggered successfully. "
-                    "Results will be available in Egeria after processing completes. "
-                    "Use 'database info' to check for results later."
-                ),
-                "errors": [],
-            }
+            engine_action_guid = egeria_result.get("survey_action_guid", "")
+            log.info(f"Egeria survey triggered: {engine_action_guid}")
         except Exception as exc:
-            log.error(f"Egeria survey failed for {db_entity.slug}: {exc}")
-            log.info("Falling back to custom surveyor")
-            
-            # Fall back to custom surveyor
-            return self._run_custom_survey(db_entity, None)
+            log.error(f"Egeria catalog/survey failed for {db_entity.slug}: {exc}")
+            log.info("Falling back to custom surveyor only")
+            return self._run_custom_survey(db_entity, credentials)
+
+        # Egeria survey is async — also run a local custom scan for immediate display.
+        if credentials or db_user:
+            resolved_creds = credentials or {"user": db_user, "password": db_pwd}
+            result = self._run_custom_survey(db_entity, resolved_creds)
+            result["source"] = "egeria"
+            result["engine_action_guid"] = engine_action_guid
+            result["message"] = (
+                "Egeria survey triggered (results populate asynchronously). "
+                "Local schema scan completed — data shown is from the local scan."
+            )
+            return result
+
+        # No credentials available for local scan.
+        return {
+            "source": "egeria",
+            "database_slug": db_entity.slug,
+            "surveyed_at": datetime.utcnow().isoformat(),
+            "status": "pending",
+            "engine_action_guid": engine_action_guid,
+            "message": "Egeria survey triggered. Results will be available in Egeria after processing.",
+            "errors": [],
+        }
 
     def _run_custom_survey(
         self,

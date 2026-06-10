@@ -184,7 +184,32 @@ class DatabaseSurveyor:
     def _store_results(self, results: dict) -> None:
         """Store survey results in the registry."""
         schema_info = results["schema_info"]
-        
+        statistics  = results.get("statistics", {})
+
+        # Enrich each table with row count + activity timestamps from pg_stat_user_tables
+        row_lookup: dict[tuple, dict] = {
+            (rs["schemaname"], rs["tablename"]): rs
+            for rs in statistics.get("row_stats", [])
+        }
+        for schema in schema_info.get("schemas", []):
+            for table in schema["tables"]:
+                rs = row_lookup.get((schema["name"], table["name"]), {})
+                table["row_count"]      = rs.get("row_count", 0)
+                table["last_analyzed"]  = rs.get("last_analyzed", "")
+                table["last_vacuumed"]  = rs.get("last_vacuumed", "")
+                table["pending_changes"] = rs.get("pending_changes", 0)
+
+        # Also enrich size data from table_stats
+        size_lookup: dict[tuple, dict] = {
+            (ts["schemaname"], ts["tablename"]): ts
+            for ts in statistics.get("table_stats", [])
+        }
+        for schema in schema_info.get("schemas", []):
+            for table in schema["tables"]:
+                ts = size_lookup.get((schema["name"], table["name"]), {})
+                table["size_bytes"] = ts.get("total_bytes", 0) or 0
+                table["size_pretty"] = ts.get("total_size", "")
+
         self.registry.record_database_survey(
             slug=self.db_entity.slug,
             schema_count=len(schema_info.get("schemas", [])),
@@ -192,7 +217,7 @@ class DatabaseSurveyor:
             column_count=schema_info.get("total_columns", 0),
             survey_data={
                 "schema_info": schema_info,
-                "statistics": results["statistics"],
+                "statistics": statistics,
                 "annotation_count": len(results["annotations"]),
             },
         )
