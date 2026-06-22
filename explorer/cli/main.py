@@ -817,6 +817,287 @@ def egeria_reports(
         console.print()
 
 
+# ── database sub-group ────────────────────────────────────────────────────────
+
+database_app = typer.Typer(name="database", help="Manage database entities and surveys.")
+app.add_typer(database_app)
+
+
+@database_app.command(name="register")
+def database_register(
+    slug: str = typer.Argument(help="Unique identifier for this database"),
+    db_type: str = typer.Option(..., "--type", help="Database type (postgresql, mysql, etc.)"),
+    host: str = typer.Option(..., "--host", help="Database host"),
+    port: int = typer.Option(..., "--port", help="Database port"),
+    database: str = typer.Option(..., "--database", help="Database name"),
+    display_name: Optional[str] = typer.Option(None, "--name", help="Display name (defaults to slug)"),
+    description: str = typer.Option("", "--description", help="Database description"),
+):
+    """Register a database in the registry.
+    
+    Example:
+        project-explorer database register my-postgres \\
+            --type postgresql \\
+            --host localhost \\
+            --port 5432 \\
+            --database mydb \\
+            --name "My PostgreSQL Database"
+    """
+    from explorer.registry import DatabaseEntity, ProjectRegistry
+    
+    registry = ProjectRegistry()
+    
+    # Check if already exists
+    if registry.database_exists(slug):
+        console.print(f"[red]Database '{slug}' already registered.[/red]")
+        raise typer.Exit(1)
+    
+    # Create database entity
+    db_entity = DatabaseEntity(
+        slug=slug,
+        display_name=display_name or slug,
+        db_type=db_type,
+        host=host,
+        port=port,
+        database_name=database,
+        description=description,
+    )
+    
+    # Register
+    registry.register_database(db_entity)
+    console.print(f"[green]✓ Database '{slug}' registered successfully.[/green]")
+    console.print(f"  Type: {db_type}")
+    console.print(f"  Host: {host}:{port}")
+    console.print(f"  Database: {database}")
+
+
+@database_app.command(name="list")
+def database_list(
+    db_type: Optional[str] = typer.Option(None, "--type", help="Filter by database type"),
+):
+    """List all registered databases."""
+    from explorer.registry import ProjectRegistry
+    from rich.table import Table
+    
+    registry = ProjectRegistry()
+    databases = registry.list_databases(db_type)
+    
+    if not databases:
+        console.print("[dim]No databases registered.[/dim]")
+        return
+    
+    table = Table("Slug", "Display Name", "Type", "Host", "Database", "Last Surveyed")
+    for db in databases:
+        last_surveyed = db.last_surveyed_at[:10] if db.last_surveyed_at else "Never"
+        table.add_row(
+            db.slug,
+            db.display_name,
+            db.db_type,
+            f"{db.host}:{db.port}",
+            db.database_name,
+            last_surveyed,
+        )
+    
+    console.print(table)
+
+
+@database_app.command(name="survey")
+def database_survey(
+    slug: str = typer.Argument(help="Database slug to survey"),
+    user: Optional[str] = typer.Option(None, "--user", "-u", help="Database username (required for custom survey)"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", help="Database password (required for custom survey)", hide_input=True),
+    use_egeria: bool = typer.Option(False, "--egeria", help="Try Egeria survey first (hybrid approach)"),
+    force_custom: bool = typer.Option(False, "--force-custom", help="Skip Egeria and use custom surveyor"),
+    egeria_url: Optional[str] = typer.Option(None, "--egeria-url", help="Egeria platform URL (overrides EGERIA_PLATFORM_URL)"),
+    egeria_server: Optional[str] = typer.Option(None, "--egeria-server", help="Egeria view server name (overrides EGERIA_VIEW_SERVER)"),
+    secrets_path: Optional[str] = typer.Option(None, "--secrets-path", help="Path to Egeria secrets file"),
+):
+    """Run a survey on a registered database using hybrid approach.
+    
+    By default, uses custom surveyor (requires --user and --password).
+    With --egeria, tries Egeria first and falls back to custom if needed.
+    
+    Examples:
+        # Custom survey (direct connection)
+        project-explorer database survey my-postgres --user admin --password secret
+        
+        # Hybrid approach (try Egeria first, fall back to custom)
+        project-explorer database survey my-postgres --egeria --user admin --password secret
+        
+        # Force custom survey (skip Egeria)
+        project-explorer database survey my-postgres --force-custom --user admin --password secret
+        
+        # Egeria-only survey (with secrets file)
+        project-explorer database survey my-postgres --egeria --secrets-path /path/to/secrets.omsecrets
+    """
+    from explorer.registry import ProjectRegistry
+    
+    registry = ProjectRegistry()
+    
+    # Check if database exists
+    if not registry.database_exists(slug):
+        console.print(f"[red]Database '{slug}' not found. Register it first with 'database register'.[/red]")
+        raise typer.Exit(1)
+    
+    # Determine survey mode
+    if use_egeria or (not force_custom and not user):
+        # Use hybrid approach
+        from explorer.surveyors.database.hybrid_database_surveyor import run_hybrid_survey
+        
+        console.print(f"[cyan]Surveying database '{slug}' (hybrid mode)...[/cyan]")
+        
+        # Prepare credentials if provided
+        credentials = None
+        if user and password:
+            credentials = {"user": user, "password": password}
+        
+        try:
+            results = run_hybrid_survey(
+                slug,
+                credentials=credentials,
+                registry=registry,
+                force_custom=force_custom,
+                platform_url=egeria_url,
+                view_server=egeria_server,
+                secrets_path=secrets_path,
+            )
+        except Exception as e:
+            console.print(f"[red]✗ Survey failed: {e}[/red]")
+            raise typer.Exit(1)
+    else:
+        # Use custom surveyor directly
+        from explorer.surveyors.database.database_surveyor import run_database_survey
+        
+        if not user or not password:
+            console.print("[red]Custom survey requires --user and --password options.[/red]")
+            raise typer.Exit(1)
+        
+        console.print(f"[cyan]Surveying database '{slug}' (custom mode)...[/cyan]")
+        
+        try:
+            results = run_database_survey(
+                slug,
+                {"user": user, "password": password},
+                registry,
+            )
+        except Exception as e:
+            console.print(f"[red]✗ Survey failed: {e}[/red]")
+            raise typer.Exit(1)
+    
+    # Display results
+    if results.get("errors"):
+        console.print(f"[red]✗ Survey failed:[/red]")
+        for error in results["errors"]:
+            console.print(f"  {error}")
+        raise typer.Exit(1)
+    
+    # Show survey source
+    source = results.get("source", "unknown")
+    if source == "egeria":
+        console.print(f"[green]✓ Survey completed (source: Egeria)[/green]")
+        
+        # Check if pending
+        if results.get("status") == "pending":
+            console.print(f"\n[yellow]{results.get('message', 'Survey pending')}[/yellow]")
+            if results.get("engine_action_guid"):
+                console.print(f"[dim]Engine Action GUID: {results['engine_action_guid']}[/dim]")
+            return
+        
+        # Show Egeria results
+        console.print(f"\n[bold]Survey Report:[/bold]")
+        console.print(f"  Report GUID: {results.get('egeria_report_guid', 'N/A')}")
+        console.print(f"  Annotations: {results.get('annotation_count', 0)}")
+        if results.get("description"):
+            console.print(f"  Description: {results['description']}")
+        
+    elif source == "custom":
+        console.print(f"[green]✓ Survey completed (source: Custom)[/green]")
+        
+        schema_info = results.get("schema_info", {})
+        stats = results.get("statistics", {})
+        
+        console.print(f"\n[bold]Schema Summary:[/bold]")
+        console.print(f"  Schemas: {len(schema_info.get('schemas', []))}")
+        console.print(f"  Tables: {schema_info.get('total_tables', 0)}")
+        console.print(f"  Columns: {schema_info.get('total_columns', 0)}")
+        
+        db_size = stats.get("database_size", {})
+        if db_size:
+            console.print(f"\n[bold]Database Size:[/bold]")
+            console.print(f"  {db_size.get('size_pretty', 'unknown')}")
+        
+        console.print(f"\n[bold]Annotations:[/bold] {len(results.get('annotations', []))} created")
+        console.print(f"[dim]Results stored in registry.[/dim]")
+    else:
+        console.print(f"[yellow]Unknown survey source: {source}[/yellow]")
+
+
+@database_app.command(name="remove")
+def database_remove(
+    slug: str = typer.Argument(help="Database slug to remove"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """Remove a database from the registry."""
+    from explorer.registry import ProjectRegistry
+    
+    registry = ProjectRegistry()
+    db = registry.get_database(slug)
+    
+    if not db:
+        console.print(f"[red]Database '{slug}' not found.[/red]")
+        raise typer.Exit(1)
+    
+    if not yes:
+        typer.confirm(f"Remove database '{db.display_name}' ({slug})?", abort=True)
+    
+    registry.remove_database(slug)
+    console.print(f"[green]✓ Database '{slug}' removed.[/green]")
+
+
+@database_app.command(name="info")
+def database_info(
+    slug: str = typer.Argument(help="Database slug"),
+):
+    """Show detailed information about a database."""
+    from explorer.registry import ProjectRegistry
+    from rich.table import Table
+    
+    registry = ProjectRegistry()
+    db = registry.get_database(slug)
+    
+    if not db:
+        console.print(f"[red]Database '{slug}' not found.[/red]")
+        raise typer.Exit(1)
+    
+    console.print(f"\n[bold]{db.display_name}[/bold] ({db.slug})")
+    console.print(f"Type: {db.db_type}")
+    console.print(f"Host: {db.host}:{db.port}")
+    console.print(f"Database: {db.database_name}")
+    console.print(f"Status: {db.status.value}")
+    if db.description:
+        console.print(f"Description: {db.description}")
+    console.print(f"Registered: {db.registered_at[:10]}")
+    if db.last_surveyed_at:
+        console.print(f"Last Surveyed: {db.last_surveyed_at[:10]}")
+    
+    # Show survey history
+    surveys = registry.get_database_surveys(slug)
+    if surveys:
+        console.print(f"\n[bold]Survey History:[/bold] ({len(surveys)} surveys)")
+        table = Table("Date", "Schemas", "Tables", "Columns")
+        for survey in surveys[:5]:  # Show last 5
+            table.add_row(
+                survey["surveyed_at"][:10],
+                str(survey["schema_count"]),
+                str(survey["table_count"]),
+                str(survey["column_count"]),
+            )
+        console.print(table)
+    else:
+        console.print("\n[dim]No surveys yet.[/dim]")
+
+
+
 def _try_build_egeria_client(platform_url: Optional[str], view_server: Optional[str]):
     """Attempt to build a pyegeria client for optional cache refresh. Returns None on failure."""
     import os

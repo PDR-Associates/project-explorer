@@ -311,6 +311,31 @@ GET  /api/egeria/{slug}/survey-report     → SurveyReportData from SQLite inclu
 POST /api/egeria/{slug}/survey            → SurveyOnlyResult {status, annotation_count, surveyed_at, errors}
 POST /api/egeria/{slug}/publish           → PublishResult {status, report_guid, annotation_count, surveyed_at}
 POST /api/egeria/{slug}/catalog-elements  → CatalogResult; AssetMaker(view_server, platform_url, …) — note arg order
+
+# web/routes/db_servers.py  (prefix /api/db-servers)
+GET    /api/db-servers/                   → list[ServerSummary] (each includes databases[] scoped to that server)
+GET    /api/db-servers/{slug}             → ServerSummary
+POST   /api/db-servers/register           → ServerSummary; stores host/port/credentials/Egeria config
+DELETE /api/db-servers/{slug}             → {removed: slug}
+POST   /api/db-servers/{slug}/test        → {status, server_version, database_count}; uses stored credentials
+POST   /api/db-servers/_test-inline       → {status, server_version, database_count}; tests without registering
+POST   /api/db-servers/{slug}/discover    → list[DiscoveredDatabase]; live pg_database query; is_registered flag
+POST   /api/db-servers/{slug}/add-database → {slug, database_name, server_slug}; inherits credentials from server
+
+# web/routes/databases.py  (prefix /api/databases)
+GET    /api/databases/                    → list[DatabaseSummary] (server_slug, egeria_asset_guid, last_survey_source included)
+GET    /api/databases/{slug}              → DatabaseSummary
+POST   /api/databases/register            → DatabaseSummary; standalone registration (no server required)
+DELETE /api/databases/{slug}              → {removed: slug}
+GET    /api/databases/{slug}/surveys      → list[survey records] newest first
+POST   /api/databases/{slug}/survey       → SurveyResult {status, slug, source, schema_count, table_count, column_count}
+                                            use_egeria=true → HybridDatabaseSurveyor (Egeria + local scan)
+                                            force_custom=true → DatabaseSurveyor only
+                                            default → DatabaseSurveyor only
+POST   /api/databases/{slug}/publish      → PublishResult {status, server_guid, asset_guid, report_guid,
+                                            server_display_name, database_display_name, annotation_count}
+                                            calls EgeriaDatabaseSurveyor.publish_local_survey()
+                                            = catalog_and_survey() with stored credentials
 ```
 
 Web UI — Survey Report tab (`web/static/index.html`):
@@ -323,7 +348,79 @@ Web UI — Survey Report tab (`web/static/index.html`):
 - "💬 Ask about this" button pre-fills the chat input with a summary question and switches to Chat tab
 - Resizable sidebar: drag the 4px handle between sidebar and main panel; width persists in localStorage
 
-### TUI (Textual)
+### Database Surveying
+
+The web UI exposes a **Databases** sidebar tab (next to Repos) for discovering and surveying PostgreSQL databases. No CLI commands are needed — everything is done through the web UI.
+
+#### Data Model
+
+`DatabaseServer` (SQLite `db_servers` table):
+- Represents a PostgreSQL server endpoint (host, port, credentials, Egeria connection config)
+- `egeria_host` — hostname Egeria uses to connect (e.g. `host.docker.internal` when Egeria runs in Docker, where the local machine uses `localhost`)
+- One server → many databases (FK `databases.server_slug`)
+
+`DatabaseEntity` (SQLite `databases` table):
+- Represents one database on a server
+- `server_slug` — FK to `db_servers`; empty for standalone (legacy/manually-registered) databases
+- `egeria_asset_guid` — Egeria database element GUID; set after first catalog; used to determine "Catalog" vs "Re-survey" button label
+- Inherits `db_user`, `db_password`, `egeria_*` config from server when added via Discover flow
+
+`database_surveys` SQLite table:
+- `(database_slug, surveyed_at, egeria_report_guid, schema_count, table_count, column_count, survey_data JSON, source)`
+- `source` values: `"local"` / `"egeria"` (hybrid triggered Egeria + ran local scan) / `"egeria-published"` (Publish button)
+- `survey_data` contains `{"schema_info": {schemas, total_tables, total_columns}, "statistics": {row_stats, table_stats}}`
+- Schema info includes per-column: `type` (display, e.g. `varchar(255)`), `base_type`, `nullable`, `default`, `position`, `description` (from `col_description()`), `is_primary_key`, `foreign_key {schema, table, column}`
+- Per-table: `description` from `obj_description()`, `row_count` from `pg_stat_user_tables`, `last_analyzed`, `last_vacuumed`, `size_pretty`
+- Accessed via `registry.record_database_survey()` / `get_database_surveys()` / `get_latest_database_survey()`
+
+#### Survey Strategies
+
+**Local survey** (`DatabaseSurveyor`):
+- Connects via psycopg2 to the target database
+- Reads `information_schema` for schemas/tables/columns
+- Reads `pg_description` via `obj_description()` / `col_description()` for developer-written comments
+- Reads `information_schema.table_constraints` + `key_column_usage` for PK/FK detection
+- Reads `pg_stat_user_tables` for row counts and activity timestamps
+- Stores results in `database_surveys` with `source="local"`
+
+**Hybrid survey** (`HybridDatabaseSurveyor`, triggered by `use_egeria=true`):
+1. Calls `EgeriaDatabaseSurveyor.catalog_and_survey()` — registers server + DB in Egeria, triggers native Egeria surveys asynchronously
+2. Immediately also runs the local `DatabaseSurveyor` scan so schema data is available right away
+3. Returns with `source="egeria"` — Egeria native annotations appear in Asset Catalog asynchronously, local schema data is displayed immediately
+4. Falls back to local-only if Egeria is unavailable or unconfigured
+
+**Catalog & Survey in Egeria** (`EgeriaDatabaseSurveyor.catalog_and_survey()`):
+- Creates PostgreSQL server element via `AutomatedCuration.create_postgres_server_element_from_template()`
+- Creates PostgreSQL database element via `AutomatedCuration.create_postgres_database_element_from_template()`
+- Triggers `initiate_postgres_server_survey(server_guid)` — Egeria surveys the server itself (connection metadata, database list)
+- Triggers `initiate_postgres_database_survey(db_guid)` — Egeria surveys the database (schemas, tables, columns, relationships, data types)
+- Both surveys are async in Egeria; `survey_action_guid` and `server_survey_guid` are returned immediately
+- Persists `egeria_asset_guid` to `databases.egeria_asset_guid` via `registry.set_database_egeria_guid()`
+- `initiate_postgres_server_survey` is caught with `AttributeError` if not present in the installed pyegeria version (non-fatal)
+
+#### Web UI — Databases Tab
+
+Left sidebar **🗄 Databases** tab shows a two-level hierarchy:
+- **Servers**: always-visible ⚡ (test connection), 🔍 (discover databases), 🗑 (remove) buttons via `.srv-actions` (no hover required)
+  - Click server name → loads server properties panel in main area (host, port, Egeria config, linked databases)
+  - 🔍 Discover → live `pg_database` query → modal listing available databases with size, owner, `is_registered` flag; click to add
+- **Databases under server**: click to load DB Survey view
+- **Standalone databases** (no `server_slug` or server not in `_srvMap`): shown in a separate section
+
+**Add Server** modal: slug, display name, host, port, db_user, db_password, optional Egeria config fields (egeria_host, egeria_url, egeria_server, egeria_user, egeria_password). Connection test runs before registration.
+
+**DB Survey view** (right panel when database selected):
+- Header shows display name, connection string, source badge (`☁ Egeria` / `🏠 Local` / `🔄 Egeria + Local`), Egeria GUID if registered
+- **Catalog & Survey in Egeria →** button (first time) or **☁ Re-survey in Egeria** (if `egeria_asset_guid` already set)
+- Schema accordion: each schema → tables with row count, size, last analyzed; each table → columns with type, PK/FK badges, description
+- Plotly charts: schema distribution, table size, row counts, column type distribution
+- **📋 Activity log** (header button, always visible): shows every operation with structured item table for cataloged Egeria objects (Server GUID, Database GUID, Survey Action GUID — click any GUID to copy); source label per survey
+
+**Publish / Re-survey semantics**:
+- First catalog (`egeria_asset_guid` empty): registers server + DB in Egeria, triggers both server-level and database-level Egeria native surveys
+- Re-survey (`egeria_asset_guid` set): finds existing asset by GUID, triggers a fresh Egeria survey — useful after schema changes without re-registering
+
+#### TUI (Textual)
 
 `tui/app.py` full-screen Textual app with clarification handling:
 - `_pending_clarification` state set when agent returns clarification response
@@ -387,6 +484,14 @@ Not every project gets every collection — `RepoAnalyzer` inspects the repo and
 34. `IncrementalIndexer.refresh()` always calls `_store_file_inventory()` and `_profile_data_files()` when the repo is downloaded (any path that has file-based collections to re-index). When no new commits are found (`last_sha == latest_sha`) but `project_data_profiles` is empty, it calls `_run_profile_only()` which downloads the repo just for profiling. This means `project-explorer refresh <slug>` always populates profiles — never rely on telling users to re-add a project just to get profiles.
 35. `AssetMaker` constructor argument order is `(view_server, platform_url, user_id, user_password)` — note that `view_server` comes first, unlike some pyegeria examples. Swapping to `(platform_url, view_server, …)` passes the view server name as the URL and produces `VALIDATION_ERROR_1 → Invalid URL`. Verify against `EgeriaPublisher._connect()` as the canonical reference.
 36. `POST /api/projects/{slug}/refresh` is synchronous (uses `asyncio.to_thread`), not a background task. It captures stdout from `IncrementalIndexer.refresh()` and returns `RefreshResult {status, slug, message, error}`. The web sidebar 🔄 button spins until it completes and shows ✓/✗. Do not revert to `BackgroundTasks` — the UI needs the result to know when to reload the report tab.
+37. `DatabaseSummary` must include `server_slug` for the UI to group databases under their server. Without it, `renderDatabaseList` sees `d.server_slug === undefined` and routes every database to the standalone section. Always populate `server_slug` in `_to_summary()` via `getattr(db, "server_slug", "") or ""`.
+38. `HybridDatabaseSurveyor._run_egeria_survey()` must run the local custom scan immediately after triggering the Egeria native survey — Egeria surveys are async and produce no immediate schema data. Without the local scan, `database_surveys` has no record, `get_database_surveys()` returns empty, and the UI shows "Run First Survey". The result has `source="egeria"` and `engine_action_guid` set so the UI knows Egeria was also triggered.
+39. `EgeriaDatabaseSurveyor.catalog_and_survey()` triggers both `initiate_postgres_server_survey(server_guid)` and `initiate_postgres_database_survey(db_guid)`. Call server survey first (captures connection info and database list at server level), then database survey (captures schemas, tables, columns). Wrap `initiate_postgres_server_survey` in `except AttributeError` — older pyegeria versions may not have it.
+40. `DatabaseEntity.egeria_asset_guid` drives the UI "Catalog vs Re-survey" distinction. When the GUID is set, `showPublishDbModal()` changes the button label to "Re-survey in Egeria →" and the description to explain the asset is already registered. The `DatabaseSummary` must expose `egeria_asset_guid` so the frontend can check it without an extra API call. Populate it in `_to_summary()` via `getattr(db, "egeria_asset_guid", "") or ""`.
+41. Activity log `items` array holds structured cataloged Egeria objects: `{kind, name, guid}`. Populate it from `PublishResult.server_guid`, `asset_guid`, `report_guid` and pass to `updateOp(opId, 'ok', summary, detail, items)`. `renderActivityLog` renders items as a three-column table (Type / Name / GUID); GUIDs are truncated to 8 chars with full value in title and click-to-copy. Do not rely on pattern-matching GUIDs out of detail text — use the structured items field.
+42. `egeria_host` on `DatabaseServer` and `DatabaseEntity` is the hostname Egeria should use when connecting to the database. When Egeria runs in Docker and the database is on the host machine, use `host.docker.internal` for `egeria_host` while `host` stays `localhost` for the Python-side connection. `catalog_and_survey()` resolves via `getattr(db_entity, "egeria_host", "") or db_entity.host`.
+43. `pg_description` comments require `obj_description((schema.table)::regclass, 'pg_class')` for table-level comments and `col_description((schema.table)::regclass, ordinal_position)` for column-level comments. These require the `(schema.table)` form (dot-separated, cast to `regclass`) — using just the table name without schema prefix fails when tables are not in `search_path`. Always qualify with schema name.
+44. `server_connection()` context manager in `connection.py` connects to the `postgres` system database (not a user database) to list available databases via `pg_database`. This is the correct approach because the target user databases may not exist yet or may be restricted. The `list_databases()` method reads `pg_database` with size, owner, description (from `pg_description`), and encoding.
 
 
 ## Module Map
@@ -394,7 +499,7 @@ Not every project gets every collection — `RepoAnalyzer` inspects the repo and
 ```
 explorer/
 ├── config.py              # Pydantic settings (ExplorerConfig)
-├── registry.py            # Project Registry (SQLite: projects [+egeria_asset_guid], project_stats, project_commits, project_code_symbols, project_dependencies, project_file_type_counts, project_file_inventory, project_data_profiles, project_egeria_surveys); Project dataclass includes subproject_path, parent_slug, extra_docs_paths, egeria_asset_guid
+├── registry.py            # Project Registry (SQLite: projects [+egeria_asset_guid], project_stats, project_commits, project_code_symbols, project_dependencies, project_file_type_counts, project_file_inventory, project_data_profiles, project_egeria_surveys, databases [+egeria_asset_guid], db_servers, database_surveys); Project dataclass includes subproject_path, parent_slug, extra_docs_paths, egeria_asset_guid; DatabaseEntity + DatabaseServer dataclasses
 ├── rag_system.py          # Main orchestrator — entry point for all queries
 ├── query_processor.py     # Intent classifier + agent router
 ├── collection_router.py   # Selects relevant collections per query
@@ -421,7 +526,9 @@ explorer/
 │       ├── query.py       # POST /api/query/ (_pick_chart keyword routing)
 │       ├── projects.py    # GET /api/projects/
 │       ├── stats.py       # GET /api/stats/{slug}/charts/{type}
-│       └── egeria.py      # GET /api/egeria/{slug}/status|annotations · POST /api/egeria/{slug}/publish
+│       ├── egeria.py      # GET /api/egeria/{slug}/status|annotations · POST /api/egeria/{slug}/publish
+│       ├── databases.py   # GET|POST /api/databases/ · POST /api/databases/{slug}/survey|publish
+│       └── db_servers.py  # GET|POST /api/db-servers/ · POST /api/db-servers/{slug}/discover|test|add-database
 ├── tui/
 │   └── app.py             # Textual full-screen TUI (clarification-aware)
 ├── dashboard/
@@ -447,6 +554,11 @@ explorer/
 │       ├── health.py          # → QualityScoreAnnotation (activity, community, release cadence, freshness)
 │       ├── documentation.py   # → ClassificationAnnotation (collection presence, hygiene files, quality label)
 │       └── security.py        # → RequestForActionAnnotation (missing SECURITY.md, CI, license)
+├── surveyors/database/    # PostgreSQL database surveying
+│   ├── connection.py          # DatabaseConnection context manager; schema/table/column/comment introspection via pg_description, pg_stat_user_tables, information_schema; server_connection() connects to postgres system DB for listing databases; list_databases() reads pg_database catalog
+│   ├── database_surveyor.py   # DatabaseSurveyor — direct psycopg2 scan; captures schemas → tables → columns with PK/FK/description; calls record_database_survey() into SQLite; run_database_survey() convenience wrapper
+│   ├── egeria_database_surveyor.py  # EgeriaDatabaseSurveyor — catalog_and_survey(): creates PostgreSQL server element + database element via AutomatedCuration templates, then triggers initiate_postgres_server_survey() + initiate_postgres_database_survey(); publish_local_survey() wraps catalog_and_survey() + records to database_surveys; source="egeria-published"
+│   └── hybrid_database_surveyor.py  # HybridDatabaseSurveyor — tries Egeria first (catalog_and_survey), then runs local custom scan with supplied credentials for immediate schema data; result has source="egeria" + engine_action_guid; falls back to custom-only if Egeria unavailable; run_hybrid_survey() convenience wrapper
 └── observability/
 ```
 

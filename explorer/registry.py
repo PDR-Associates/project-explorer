@@ -1,4 +1,4 @@
-"""Project Registry — SQLite-backed store for registered GitHub projects."""
+"""Project Registry — SQLite-backed store for registered GitHub projects and databases."""
 from __future__ import annotations
 
 import json
@@ -37,6 +37,57 @@ class Project:
     parent_slug: str = ""       # slug of the parent project when this is a sub-project
     extra_docs_paths: list[str] = field(default_factory=list)  # repo-relative paths outside subproject_path to ingest as docs/examples
     egeria_asset_guid: str = ""  # GUID of the SourceControlLibrary asset in Egeria; "" = not yet published
+
+
+@dataclass
+class DatabaseServer:
+    """Represents a PostgreSQL (or other) database server connection."""
+    slug: str
+    display_name: str
+    db_type: str = "postgresql"
+    host: str = "localhost"
+    port: int = 5432
+    description: str = ""
+    db_user: str = ""
+    db_password: str = ""
+    egeria_host: str = ""   # hostname Egeria uses (e.g. host.docker.internal)
+    egeria_url: str = ""
+    egeria_server: str = ""
+    egeria_user: str = ""
+    egeria_password: str = ""
+    status: ProjectStatus = ProjectStatus.ACTIVE
+    registered_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    error_message: str = ""
+
+
+@dataclass
+class DatabaseEntity:
+    """Represents a database in the registry."""
+    slug: str
+    display_name: str
+    db_type: str  # "postgresql", "mysql", "oracle", etc.
+    host: str       # hostname as seen from the local machine
+    port: int
+    database_name: str
+    description: str = ""
+    connection_ref: str = ""  # Reference to secrets store or connection config
+    status: ProjectStatus = ProjectStatus.ACTIVE
+    registered_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    last_surveyed_at: str = ""
+    egeria_asset_guid: str = ""  # GUID of the Database asset in Egeria
+    error_message: str = ""
+    # Stored connection credentials (plaintext — local dev tool)
+    db_user: str = ""
+    db_password: str = ""
+    # Egeria-visible hostname for the DB server (e.g. host.docker.internal when DB is in Docker)
+    egeria_host: str = ""
+    # Stored Egeria connection details
+    egeria_url: str = ""
+    egeria_server: str = ""
+    egeria_user: str = ""
+    egeria_password: str = ""
+    # Server this database belongs to (if registered via server discovery)
+    server_slug: str = ""
 
 
 class ProjectRegistry:
@@ -327,6 +378,89 @@ class ProjectRegistry:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_data_profiles_slug "
                 "ON project_data_profiles(project_slug)"
+            )
+            # Database entities table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS databases (
+                    slug TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    db_type TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    database_name TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    connection_ref TEXT DEFAULT '',
+                    status TEXT DEFAULT 'active',
+                    registered_at TEXT NOT NULL,
+                    last_surveyed_at TEXT DEFAULT '',
+                    egeria_asset_guid TEXT DEFAULT '',
+                    error_message TEXT DEFAULT '',
+                    db_user TEXT DEFAULT '',
+                    db_password TEXT DEFAULT '',
+                    egeria_host TEXT DEFAULT '',
+                    egeria_url TEXT DEFAULT '',
+                    egeria_server TEXT DEFAULT '',
+                    egeria_user TEXT DEFAULT '',
+                    egeria_password TEXT DEFAULT ''
+                )
+            """)
+            # Migration: add credential/egeria columns to existing databases tables
+            existing_db = {r[1] for r in conn.execute("PRAGMA table_info(databases)")}
+            for col, defval in [
+                ("db_user", "''"),
+                ("db_password", "''"),
+                ("egeria_host", "''"),
+                ("egeria_url", "''"),
+                ("egeria_server", "''"),
+                ("egeria_user", "''"),
+                ("egeria_password", "''"),
+                ("server_slug", "''"),
+            ]:
+                if col not in existing_db:
+                    conn.execute(f"ALTER TABLE databases ADD COLUMN {col} TEXT DEFAULT {defval}")
+            # Database servers table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS db_servers (
+                    slug TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    db_type TEXT NOT NULL DEFAULT 'postgresql',
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL DEFAULT 5432,
+                    description TEXT DEFAULT '',
+                    db_user TEXT DEFAULT '',
+                    db_password TEXT DEFAULT '',
+                    egeria_host TEXT DEFAULT '',
+                    egeria_url TEXT DEFAULT '',
+                    egeria_server TEXT DEFAULT '',
+                    egeria_user TEXT DEFAULT '',
+                    egeria_password TEXT DEFAULT '',
+                    status TEXT DEFAULT 'active',
+                    registered_at TEXT NOT NULL,
+                    error_message TEXT DEFAULT ''
+                )
+            """)
+            # Database survey results table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS database_surveys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    database_slug TEXT NOT NULL,
+                    surveyed_at TEXT NOT NULL,
+                    egeria_report_guid TEXT DEFAULT '',
+                    schema_count INTEGER DEFAULT 0,
+                    table_count INTEGER DEFAULT 0,
+                    column_count INTEGER DEFAULT 0,
+                    survey_data TEXT DEFAULT '{}',
+                    source TEXT DEFAULT 'local',
+                    FOREIGN KEY (database_slug) REFERENCES databases(slug)
+                )
+            """)
+            # Migration: add source column to existing database_surveys tables
+            existing_ds = {r[1] for r in conn.execute("PRAGMA table_info(database_surveys)")}
+            if "source" not in existing_ds:
+                conn.execute("ALTER TABLE database_surveys ADD COLUMN source TEXT DEFAULT 'local'")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_database_surveys_slug "
+                "ON database_surveys(database_slug)"
             )
 
     def add(self, project: Project) -> None:
@@ -920,3 +1054,192 @@ class ProjectRegistry:
         # Filter to only known Project fields to stay forward-compatible with schema changes
         known = {f.name for f in dataclasses.fields(Project)}
         return Project(**{k: v for k, v in d.items() if k in known})
+
+
+    # ── database entity management ────────────────────────────────────────────
+
+    def register_database(self, database: DatabaseEntity) -> None:
+        """Register a database entity in the registry."""
+        data = asdict(database)
+        data["slug"] = self._normalize_slug(data["slug"])
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO databases (
+                    slug, display_name, db_type, host, port, database_name,
+                    description, connection_ref, status, registered_at,
+                    last_surveyed_at, egeria_asset_guid, error_message,
+                    db_user, db_password, egeria_host,
+                    egeria_url, egeria_server, egeria_user, egeria_password,
+                    server_slug
+                ) VALUES (
+                    :slug, :display_name, :db_type, :host, :port, :database_name,
+                    :description, :connection_ref, :status, :registered_at,
+                    :last_surveyed_at, :egeria_asset_guid, :error_message,
+                    :db_user, :db_password, :egeria_host,
+                    :egeria_url, :egeria_server, :egeria_user, :egeria_password,
+                    :server_slug
+                )""",
+                data,
+            )
+
+    def get_database(self, slug: str) -> DatabaseEntity | None:
+        """Retrieve a database entity by slug."""
+        normalized = self._normalize_slug(slug)
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM databases WHERE slug = ?", (normalized,)).fetchone()
+        return self._row_to_database(row) if row else None
+
+    def list_databases(self, db_type: str | None = None, server_slug: str | None = None) -> list[DatabaseEntity]:
+        """List all registered databases, optionally filtered by type or server slug."""
+        with self._conn() as conn:
+            if server_slug:
+                rows = conn.execute(
+                    "SELECT * FROM databases WHERE server_slug = ? ORDER BY display_name",
+                    (self._normalize_slug(server_slug),),
+                ).fetchall()
+            elif db_type:
+                rows = conn.execute(
+                    "SELECT * FROM databases WHERE db_type = ? ORDER BY display_name",
+                    (db_type,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM databases ORDER BY display_name").fetchall()
+        return [self._row_to_database(r) for r in rows]
+
+    def update_database_status(self, slug: str, status: ProjectStatus, error: str = "") -> None:
+        """Update the status of a database entity."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE databases SET status = ?, error_message = ? WHERE slug = ?",
+                (status.value, error, slug),
+            )
+
+    def update_database_surveyed_at(self, slug: str) -> None:
+        """Update the last_surveyed_at timestamp for a database."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE databases SET last_surveyed_at = ? WHERE slug = ?",
+                (datetime.utcnow().isoformat(), slug),
+            )
+
+    def set_database_egeria_guid(self, slug: str, guid: str) -> None:
+        """Set the Egeria asset GUID for a database."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE databases SET egeria_asset_guid = ? WHERE slug = ?",
+                (guid, slug),
+            )
+
+    def remove_database(self, slug: str) -> None:
+        """Remove a database entity and all its survey records."""
+        normalized = self._normalize_slug(slug)
+        with self._conn() as conn:
+            conn.execute("DELETE FROM databases WHERE slug = ?", (normalized,))
+            conn.execute("DELETE FROM database_surveys WHERE database_slug = ?", (normalized,))
+
+    def record_database_survey(
+        self,
+        slug: str,
+        schema_count: int,
+        table_count: int,
+        column_count: int,
+        survey_data: dict,
+        egeria_report_guid: str = "",
+        source: str = "local",
+    ) -> None:
+        """Record a database survey result."""
+        slug = self._normalize_slug(slug)
+        surveyed_at = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO database_surveys
+                   (database_slug, surveyed_at, egeria_report_guid, schema_count,
+                    table_count, column_count, survey_data, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (slug, surveyed_at, egeria_report_guid, schema_count,
+                 table_count, column_count, json.dumps(survey_data), source),
+            )
+        self.update_database_surveyed_at(slug)
+
+    def get_database_surveys(self, slug: str) -> list[dict]:
+        """Return all survey records for a database, newest first."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT database_slug, surveyed_at, egeria_report_guid,
+                          schema_count, table_count, column_count, survey_data, source
+                   FROM database_surveys
+                   WHERE database_slug = ?
+                   ORDER BY surveyed_at DESC""",
+                (slug,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_latest_database_survey(self, slug: str) -> dict | None:
+        """Return the most recent survey record for a database, or None."""
+        surveys = self.get_database_surveys(slug)
+        return surveys[0] if surveys else None
+
+    def database_exists(self, slug: str) -> bool:
+        """Check if a database entity exists."""
+        return self.get_database(slug) is not None
+
+    def _row_to_database(self, row: sqlite3.Row) -> DatabaseEntity:
+        """Convert a database row to a DatabaseEntity dataclass."""
+        import dataclasses
+        d = dict(row)
+        d["status"] = ProjectStatus(d["status"])
+        # Filter to only known DatabaseEntity fields
+        known = {f.name for f in dataclasses.fields(DatabaseEntity)}
+        return DatabaseEntity(**{k: v for k, v in d.items() if k in known})
+
+    # ── database server management ────────────────────────────────────────────
+
+    def register_server(self, server: DatabaseServer) -> None:
+        """Register a database server in the registry."""
+        data = asdict(server)
+        data["slug"] = self._normalize_slug(data["slug"])
+        data["status"] = data["status"] if isinstance(data["status"], str) else data["status"]
+        with self._conn() as conn:
+            conn.execute("""INSERT INTO db_servers VALUES (
+                :slug, :display_name, :db_type, :host, :port, :description,
+                :db_user, :db_password, :egeria_host,
+                :egeria_url, :egeria_server, :egeria_user, :egeria_password,
+                :status, :registered_at, :error_message
+            )""", data)
+
+    def get_server(self, slug: str) -> DatabaseServer | None:
+        """Retrieve a database server by slug."""
+        normalized = self._normalize_slug(slug)
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM db_servers WHERE slug = ?", (normalized,)).fetchone()
+        return self._row_to_server(row) if row else None
+
+    def list_servers(self) -> list[DatabaseServer]:
+        """List all registered database servers."""
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM db_servers ORDER BY display_name").fetchall()
+        return [self._row_to_server(r) for r in rows]
+
+    def remove_server(self, slug: str) -> None:
+        """Remove a database server and all its linked databases."""
+        normalized = self._normalize_slug(slug)
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM database_surveys WHERE database_slug IN "
+                "(SELECT slug FROM databases WHERE server_slug = ?)",
+                (normalized,),
+            )
+            conn.execute("DELETE FROM databases WHERE server_slug = ?", (normalized,))
+            conn.execute("DELETE FROM db_servers WHERE slug = ?", (normalized,))
+
+    def _row_to_server(self, row: sqlite3.Row) -> DatabaseServer:
+        """Convert a db_servers row to a DatabaseServer dataclass."""
+        import dataclasses
+        d = dict(row)
+        d["status"] = ProjectStatus(d.get("status", "active"))
+        known = {f.name for f in dataclasses.fields(DatabaseServer)}
+        return DatabaseServer(**{k: v for k, v in d.items() if k in known})
