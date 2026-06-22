@@ -1,8 +1,54 @@
 # Project Explorer
 
-A production-quality multi-agent RAG reference implementation for exploring and understanding **GitHub repositories** and **databases** through natural language.
+**Project Explorer turns GitHub repositories and databases into something you can simply talk to.**
 
-Built on open-source components from the LF AI & Data Foundation ecosystem.
+Point it at a project — Apache Arrow, your own monorepo, a PostgreSQL server — and it
+ingests the code, documentation, commit history, and schemas, then lets you explore
+everything in plain English. It's a production-quality, multi-agent RAG reference
+implementation built entirely on open-source components from the LF AI & Data Foundation
+ecosystem (BeeAI, Milvus, Docling, Egeria, Ollama).
+
+It's aimed at technical users and product managers who need to evaluate or understand a
+project quickly — **no AI/ML expertise required.**
+
+![Project Explorer welcome screen](docs/project-explorer-welcome.png)
+
+## What it can do
+
+- **Ask questions about any repository.** Project Explorer classifies your intent and
+  routes it to the right specialist agent — code search, documentation, statistics,
+  health, or comparison — retrieves the relevant context from a vector store, and
+  synthesizes a grounded answer. It cites sources and says "I don't know" rather than
+  hallucinate.
+
+  ![Chat with a project](docs/project-explorer-chat.png)
+
+- **See a project at a glance.** Live charts for stars, commit activity, languages,
+  community health, and file-type breakdown, pulled from the GitHub API and a local
+  time-series.
+
+  ![Health and activity charts](docs/project-explorer-health.png)
+
+- **Survey a project like a data catalog.** The Egeria-aligned surveyor profiles the
+  repository — file types, sizes, languages, dependencies, API structure, documentation
+  hygiene, security posture, and data-file schemas — and produces an annotated survey
+  report. No Egeria instance required to run it locally.
+
+  ![Survey report](docs/project-explorer-survey-report.png)
+
+- **Catalog into Egeria.** Optionally publish surveys, annotations, and assets to an
+  Egeria metadata server, then drill back into the annotations from the UI.
+
+  ![Egeria annotations](docs/project-explorer-egeria-annotations.png)
+
+- **Discover and survey databases.** Register a PostgreSQL server, discover its
+  databases, and survey their schemas, tables, columns, keys, and comments — locally or
+  via Egeria's native database surveys.
+
+  ![Database surveying](docs/project-explorer-databases.png)
+
+Everything is available from a CLI, a full-screen TUI, or the browser-based web UI shown
+above.
 
 ## Installation & Usage
 
