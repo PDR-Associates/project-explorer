@@ -1,6 +1,7 @@
 .env
 *.key
 .DS_Store
+docs/archive/
 .idea/
 *.iml
 __pycache__/

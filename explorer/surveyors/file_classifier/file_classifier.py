@@ -3,7 +3,7 @@ import os
 import shutil
 from datetime import datetime
 from typing import Optional
-from explorer.surveyors.file_classifier.file_classificaiton import FileClassification
+from explorer.surveyors.file_classifier.file_classification import FileClassification
 
 class FileReferenceDataCache:
     def __init__(self, file_type: Optional[str] = None, 

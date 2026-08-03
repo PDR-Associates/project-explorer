@@ -303,8 +303,8 @@ Ensure the user has SELECT permissions on:
 ## Related Documentation
 
 - [Database Surveyor Design](database-surveyor-design.md) - Full architecture
-- [Phase 2 Completion State](PHASE2_COMPLETION_STATE.md) - Implementation details
-- [Egeria PostgreSQL Exploration](egeria-postgresql-exploration.md) - Egeria capabilities
+- [Surveyor Reference](surveyor-reference.md) - All surveyors and annotations
+- The web UI **🗄 Databases** tab is the primary, recommended way to discover and survey databases
 
 ## Support
 

@@ -515,6 +515,110 @@ def aliases_remove(
         console.print(f'[yellow]Alias "{alias}" not found.[/yellow]')
 
 
+groups_app = typer.Typer(name="group", help="Group related repos under an umbrella project (e.g. 'egeria' containing egeria, egeria-python, egeria-advisor).")
+app.add_typer(groups_app)
+
+
+@groups_app.command(name="create")
+def group_create(
+    slug: str = typer.Argument(help="Group slug, e.g. 'egeria'"),
+    display_name: str = typer.Option(..., "--name", help="Human-readable group name, e.g. 'Egeria'"),
+    description: str = typer.Option("", "--description", help="Optional description"),
+):
+    """Create (or rename) an umbrella project group."""
+    from explorer.registry import ProjectRegistry
+    ProjectRegistry().create_group(slug, display_name, description)
+    console.print(f"[green]Group '{display_name}' ({slug}) saved.[/green]")
+
+
+@groups_app.command(name="list")
+def group_list():
+    """List all project groups with their member repos and aggregate stats."""
+    from explorer.registry import ProjectRegistry
+    registry = ProjectRegistry()
+    groups = registry.list_groups()
+    if not groups:
+        console.print("[dim]No groups defined yet. Create one with 'project-explorer group create'.[/dim]")
+        return
+    from rich.table import Table
+    tbl = Table("Group", "Slug", "Repos", "Stars", "Forks", "Commits (90d)")
+    for g in groups:
+        members = registry.list_projects_in_group(g.slug)
+        stats = registry.get_group_aggregate_stats(g.slug)
+        tbl.add_row(
+            g.display_name, g.slug, str(len(members)),
+            str(stats["stars"]), str(stats["forks"]), str(stats["commits_90d"]),
+        )
+    console.print(tbl)
+
+
+@groups_app.command(name="show")
+def group_show(slug: str = typer.Argument(help="Group slug")):
+    """Show member repos and aggregate stats for a single group."""
+    from explorer.registry import ProjectRegistry
+    registry = ProjectRegistry()
+    group = registry.get_group(slug)
+    if not group:
+        console.print(f"[red]Group '{slug}' not found.[/red]")
+        raise typer.Exit(1)
+    members = registry.list_projects_in_group(slug)
+    stats = registry.get_group_aggregate_stats(slug)
+    console.print(f"[bold]{group.display_name}[/bold] ({group.slug}) — {len(members)} repo(s)")
+    if group.description:
+        console.print(f"[dim]{group.description}[/dim]")
+    console.print(
+        f"★ {stats['stars']}  ·  ⑂ {stats['forks']}  ·  commits (90d) {stats['commits_90d']}  ·  "
+        f"contributors (max) {stats['contributors_count']}"
+    )
+    from rich.table import Table
+    tbl = Table("Slug", "Display Name", "GitHub URL")
+    for m in members:
+        tbl.add_row(m.slug, m.display_name, m.github_url)
+    console.print(tbl)
+
+
+@groups_app.command(name="assign")
+def group_assign(
+    project_slug: str = typer.Argument(help="Project slug to assign"),
+    group_slug: str = typer.Argument(help="Group slug to assign it to"),
+):
+    """Assign a registered project to a group (the group must already exist)."""
+    from explorer.registry import ProjectRegistry
+    registry = ProjectRegistry()
+    if not registry.exists(project_slug):
+        console.print(f"[red]Project '{project_slug}' not found.[/red]")
+        raise typer.Exit(1)
+    if not registry.get_group(group_slug):
+        console.print(f"[red]Group '{group_slug}' not found. Create it first with 'group create'.[/red]")
+        raise typer.Exit(1)
+    registry.set_project_group(project_slug, group_slug)
+    console.print(f"[green]{project_slug} → group '{group_slug}'.[/green]")
+
+
+@groups_app.command(name="unassign")
+def group_unassign(
+    project_slug: str = typer.Argument(help="Project slug to remove from its group"),
+):
+    """Remove a project from whatever group it belongs to."""
+    from explorer.registry import ProjectRegistry
+    ProjectRegistry().set_project_group(project_slug, "")
+    console.print(f"[green]{project_slug} ungrouped.[/green]")
+
+
+@groups_app.command(name="remove")
+def group_remove(
+    slug: str = typer.Argument(help="Group slug to delete"),
+):
+    """Delete a group. Member repos are ungrouped, not removed."""
+    from explorer.registry import ProjectRegistry
+    registry = ProjectRegistry()
+    if not registry.get_group(slug):
+        console.print(f"[red]Group '{slug}' not found.[/red]")
+        raise typer.Exit(1)
+    unassigned = registry.delete_group(slug)
+    console.print(f"[green]Group '{slug}' removed ({unassigned} repo(s) ungrouped).[/green]")
+
+
 @app.command()
 def survey(
     slugs: Optional[list[str]] = typer.Argument(

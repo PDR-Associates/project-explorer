@@ -20,5 +20,5 @@ Future enhancements for the database surveyor and surrounding features. Phases 1
 
 ---
 
-For historical design and phase-completion details see `docs/database-surveyor-design.md`
-and `docs/PHASE*_COMPLETION_STATE.md`.
+For the original design see `docs/database-surveyor-design.md`. Build-time phase
+snapshots are kept in the (gitignored) `docs/archive/` folder.

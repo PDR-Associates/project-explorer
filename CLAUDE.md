@@ -303,6 +303,11 @@ POST   /api/projects/{slug}/refresh       → RefreshResult {status, slug, messa
                                             synchronous (asyncio.to_thread); detects empty profiles
                                             and downloads repo even when no new commits exist
 DELETE /api/projects/{slug}               → {removed: slug}
+GET    /api/projects/groups               → list[GroupSummary] {slug, display_name, description, projects[], stats}
+                                            registered before /{slug} so FastAPI doesn't swallow it as a slug
+POST   /api/projects/groups               → GroupSummary; create/rename a group {slug, display_name, description}
+DELETE /api/projects/groups/{slug}        → {removed, projects_unassigned}; members are ungrouped, not deleted
+POST   /api/projects/{slug}/group         → {slug, group_slug}; assign ("" clears) — group must already exist
 
 # web/routes/egeria.py  (prefix /api/egeria)
 GET  /api/egeria/{slug}/status            → {asset_guid, is_registered, platform_url, surveys[]}
@@ -492,6 +497,7 @@ Not every project gets every collection — `RepoAnalyzer` inspects the repo and
 42. `egeria_host` on `DatabaseServer` and `DatabaseEntity` is the hostname Egeria should use when connecting to the database. When Egeria runs in Docker and the database is on the host machine, use `host.docker.internal` for `egeria_host` while `host` stays `localhost` for the Python-side connection. `catalog_and_survey()` resolves via `getattr(db_entity, "egeria_host", "") or db_entity.host`.
 43. `pg_description` comments require `obj_description((schema.table)::regclass, 'pg_class')` for table-level comments and `col_description((schema.table)::regclass, ordinal_position)` for column-level comments. These require the `(schema.table)` form (dot-separated, cast to `regclass`) — using just the table name without schema prefix fails when tables are not in `search_path`. Always qualify with schema name.
 44. `server_connection()` context manager in `connection.py` connects to the `postgres` system database (not a user database) to list available databases via `pg_database`. This is the correct approach because the target user databases may not exist yet or may be restricted. The `list_databases()` method reads `pg_database` with size, owner, description (from `pg_description`), and encoding.
+45. Project groups (`project_groups` table + `projects.group_slug`) are an umbrella grouping *across separate repos* (e.g. "BeeAI" = beeai-framework + agentstack; "Egeria" = egeria + egeria-docs + egeria-python + egeria-workspaces) — distinct from `parent_slug`, which groups sub-projects *within one monorepo*. `get_group_aggregate_stats()` sums stars/forks/watchers/open_issues/commits_30d/commits_90d across member projects' latest `project_stats` row, but takes the **max** (not sum) of `contributors_count` since the same person often contributes to multiple repos in a group. Only assign top-level repos (`parent_slug == ""`) to a group — assigning sub-projects too would double-count their shared parent repo's stats.
 
 
 ## Module Map
@@ -540,7 +546,7 @@ explorer/
 │   ├── egeria_publisher.py     # SurveyResult → pyegeria API; real SourceControlLibrary creation; persists GUIDs to registry; correct annotation subtype class names
 │   ├── egeria_reader.py        # Pull path: find_asset_guid, get_survey_reports_from_registry/egeria, get_annotations, get_full_report
 │   ├── file_classifier/
-│   │   ├── file_classificaiton.py   # FileClassification dataclass
+│   │   ├── file_classification.py   # FileClassification dataclass
 │   │   ├── file_classifier.py       # FileClassifier (filesystem attrs + Egeria ValidMetadataValues lookup)
 │   │   ├── file_classifier_surveyor.py  # Sub-surveyor: reads project_file_inventory (primary) or 3-source fallback; consolidates unknowns into "Other" with extension breakdown; persists to project_file_type_counts
 │   │   └── type_cache.py            # FileTypeCache — 100+ built-in extensions (code, data, archives, ML models) + optional Egeria ValidMetadataValues; 4-level lookup priority; works fully offline

@@ -143,14 +143,19 @@
 
     <!-- Repos section -->
     <div id="repos-section" class="flex flex-col overflow-y-auto flex-1">
-      <div class="px-2 pt-2 pb-1">
+      <div class="px-2 pt-2 pb-1 flex items-center gap-1">
         <button onclick="selectProject(null)"
-          class="project-btn w-full text-left px-3 py-1.5 rounded text-sm text-slate-300 hover:bg-slate-700 transition-colors"
+          class="project-btn flex-1 text-left px-3 py-1.5 rounded text-sm text-slate-300 hover:bg-slate-700 transition-colors"
           data-slug="">
           All projects
         </button>
+        <button onclick="showManageGroupsModal()"
+          class="text-xs px-2 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 transition-colors whitespace-nowrap font-medium"
+          title="Group related repos and view aggregate stats">
+          🏷 Groups
+        </button>
       </div>
-      <div id="project-list" class="px-2 flex flex-col gap-0.5 pb-2"></div>
+      <div id="project-list" class="px-2 flex flex-col gap-1 pb-2"></div>
     </div>
 
     <!-- Databases section (hidden initially) -->
@@ -358,6 +363,31 @@
         </button>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- Manage Groups Modal -->
+<div id="manage-groups-modal" class="modal-overlay hidden">
+  <div class="modal-box" style="max-width:32rem">
+    <div class="flex items-center justify-between mb-4">
+      <span class="font-semibold text-slate-100">Manage Repo Groups</span>
+      <button onclick="hideManageGroupsModal()" class="text-slate-500 hover:text-slate-200 text-lg leading-none">×</button>
+    </div>
+
+    <div class="border-b border-slate-700 pb-3 mb-3">
+      <div class="text-xs text-slate-400 uppercase tracking-wide mb-2">New Group</div>
+      <div class="grid grid-cols-2 gap-2 mb-2">
+        <input id="grp-slug" type="text" class="modal-input" placeholder="slug, e.g. beeai">
+        <input id="grp-name" type="text" class="modal-input" placeholder="Display name, e.g. BeeAI">
+      </div>
+      <button onclick="submitCreateGroup()"
+        class="w-full py-1.5 rounded bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-medium transition-colors">
+        + Create Group
+      </button>
+      <div id="manage-groups-error" class="text-red-400 text-xs hidden mt-1"></div>
+    </div>
+
+    <div id="manage-groups-list" class="space-y-3 max-h-96 overflow-y-auto"></div>
   </div>
 </div>
 
@@ -667,20 +697,13 @@ function setEntityMode(mode) {
 }
 
 // ── projects ───────────────────────────────────────────────────────────────────
-async function loadProjects() {
-  const res = await fetch('/api/projects/');
-  const projects = await res.json();
-  const list = document.getElementById('project-list');
-  list.innerHTML = '';
-  projects.forEach(p => {
-    const colors = { active: 'text-green-400', indexing: 'text-yellow-400', error: 'text-red-400', paused: 'text-slate-500' };
-    const color = colors[p.status] || 'text-slate-400';
-    const btn = document.createElement('button');
-    btn.className = 'project-btn w-full text-left px-3 py-1.5 rounded text-sm hover:bg-slate-700 transition-colors';
-    btn.dataset.slug = p.slug;
-    btn.dataset.githubUrl = p.github_url || '';
-    btn.onclick = (e) => e.shiftKey ? toggleCompare(p.slug) : selectProject(p.slug);
-    btn.innerHTML = `
+let _groupsCache = [];
+let _collapsedGroups = new Set(JSON.parse(localStorage.getItem('pe_collapsed_groups') || '[]'));
+
+function _projectBtnHtml(p) {
+  const colors = { active: 'text-green-400', indexing: 'text-yellow-400', error: 'text-red-400', paused: 'text-slate-500' };
+  const color = colors[p.status] || 'text-slate-400';
+  return `
       <div class="flex items-center justify-between gap-1 min-w-0">
         <div class="font-medium text-slate-200 truncate">${_esc(p.display_name)}</div>
         <div class="proj-actions">
@@ -693,8 +716,74 @@ async function loadProjects() {
         </div>
       </div>
       <div class="text-xs ${color}">${p.status} · ${p.collections.length} collections</div>`;
-    list.appendChild(btn);
+}
+
+function _makeProjectBtn(p, indent) {
+  const btn = document.createElement('button');
+  btn.className = 'project-btn w-full text-left px-3 py-1.5 rounded text-sm hover:bg-slate-700 transition-colors';
+  if (indent) btn.style.marginLeft = '0.75rem';
+  btn.style.width = indent ? 'calc(100% - 0.75rem)' : '100%';
+  btn.dataset.slug = p.slug;
+  btn.dataset.githubUrl = p.github_url || '';
+  btn.onclick = (e) => e.shiftKey ? toggleCompare(p.slug) : selectProject(p.slug);
+  btn.innerHTML = _projectBtnHtml(p);
+  return btn;
+}
+
+async function loadProjects() {
+  const [projRes, groupRes] = await Promise.all([
+    fetch('/api/projects/'),
+    fetch('/api/projects/groups'),
+  ]);
+  const projects = await projRes.json();
+  _groupsCache = groupRes.ok ? await groupRes.json() : [];
+  const list = document.getElementById('project-list');
+  list.innerHTML = '';
+
+  const byGroup = new Map();
+  const ungrouped = [];
+  projects.forEach(p => {
+    if (p.group_slug) {
+      if (!byGroup.has(p.group_slug)) byGroup.set(p.group_slug, []);
+      byGroup.get(p.group_slug).push(p);
+    } else {
+      ungrouped.push(p);
+    }
   });
+
+  const sortedGroups = [..._groupsCache].sort((a, b) => a.display_name.localeCompare(b.display_name));
+
+  sortedGroups.forEach(g => {
+    const members = byGroup.get(g.slug) || [];
+    const collapsed = _collapsedGroups.has(g.slug);
+    const header = document.createElement('div');
+    header.className = 'flex items-center gap-1 px-1 py-1 mt-1 rounded hover:bg-slate-750 cursor-pointer group';
+    header.onclick = () => _toggleGroupCollapse(g.slug);
+    const stats = g.stats || {};
+    header.innerHTML = `
+      <span class="text-slate-500 text-xs w-3 shrink-0">${collapsed ? '▸' : '▾'}</span>
+      <span class="text-xs font-semibold text-slate-300 uppercase tracking-wide truncate">${_esc(g.display_name)}</span>
+      <span class="text-xs text-slate-500 whitespace-nowrap ml-auto">${members.length} repo${members.length === 1 ? '' : 's'} · ★ ${stats.stars ?? 0}</span>`;
+    list.appendChild(header);
+    if (!collapsed) {
+      members.forEach(p => list.appendChild(_makeProjectBtn(p, true)));
+    }
+  });
+
+  if (ungrouped.length && sortedGroups.length) {
+    const label = document.createElement('div');
+    label.className = 'text-xs font-semibold text-slate-500 uppercase tracking-wide px-1 py-1 mt-1';
+    label.textContent = 'Ungrouped';
+    list.appendChild(label);
+  }
+  ungrouped.forEach(p => list.appendChild(_makeProjectBtn(p, false)));
+}
+
+function _toggleGroupCollapse(slug) {
+  if (_collapsedGroups.has(slug)) _collapsedGroups.delete(slug);
+  else _collapsedGroups.add(slug);
+  localStorage.setItem('pe_collapsed_groups', JSON.stringify([..._collapsedGroups]));
+  loadProjects();
 }
 
 function selectProject(slug) {
@@ -1523,6 +1612,102 @@ async function submitRegisterDb() {
     errEl.textContent = e.message;
     errEl.classList.remove('hidden');
   }
+}
+
+// ── manage groups modal ───────────────────────────────────────────────────────
+async function showManageGroupsModal() {
+  document.getElementById('manage-groups-modal').classList.remove('hidden');
+  document.getElementById('manage-groups-error').classList.add('hidden');
+  document.getElementById('grp-slug').value = '';
+  document.getElementById('grp-name').value = '';
+  await renderManageGroupsList();
+}
+
+function hideManageGroupsModal() {
+  document.getElementById('manage-groups-modal').classList.add('hidden');
+}
+
+async function renderManageGroupsList() {
+  const [projRes, groupRes] = await Promise.all([
+    fetch('/api/projects/'), fetch('/api/projects/groups'),
+  ]);
+  const projects = await projRes.json();
+  const groups = groupRes.ok ? await groupRes.json() : [];
+  _groupsCache = groups;
+  const container = document.getElementById('manage-groups-list');
+  if (!groups.length) {
+    container.innerHTML = '<div class="text-slate-500 text-xs text-center py-2">No groups yet — create one above, then assign repos to it below.</div>';
+  } else {
+    container.innerHTML = groups.map(g => `
+      <div class="border border-slate-700 rounded p-2">
+        <div class="flex items-center justify-between mb-1">
+          <span class="text-sm font-medium text-slate-200">${_esc(g.display_name)}</span>
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-slate-500">${g.projects.length} repo${g.projects.length===1?'':'s'} · ★ ${g.stats.stars}</span>
+            <button onclick="removeGroupClick('${_esc(g.slug)}')" class="text-xs text-red-400 hover:text-red-300">Delete</button>
+          </div>
+        </div>
+      </div>`).join('');
+  }
+
+  const groupOptions = groups.map(g => `<option value="${_esc(g.slug)}">${_esc(g.display_name)}</option>`).join('');
+  const assignRows = projects.map(p => `
+    <div class="flex items-center justify-between gap-2 text-xs px-1 py-1">
+      <span class="text-slate-300 truncate flex-1">${_esc(p.display_name)}</span>
+      <select class="modal-input text-xs py-0.5" style="width:auto" onchange="assignProjectGroup('${_esc(p.slug)}', this.value)">
+        <option value="">Ungrouped</option>
+        ${groupOptions}
+      </select>
+    </div>`).join('');
+  container.innerHTML += `<div class="border-t border-slate-700 pt-2 mt-1">
+    <div class="text-xs text-slate-400 uppercase tracking-wide mb-1">Assign Repos</div>
+    ${assignRows}
+  </div>`;
+  // Reflect current assignment in each select
+  [...container.querySelectorAll('select')].forEach((sel, i) => {
+    sel.value = projects[i].group_slug || '';
+  });
+}
+
+async function submitCreateGroup() {
+  const slug = document.getElementById('grp-slug').value.trim();
+  const display_name = document.getElementById('grp-name').value.trim();
+  const errEl = document.getElementById('manage-groups-error');
+  errEl.classList.add('hidden');
+  if (!slug || !display_name) {
+    errEl.textContent = 'Slug and display name are required.';
+    errEl.classList.remove('hidden');
+    return;
+  }
+  try {
+    const res = await fetch('/api/projects/groups', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ slug, display_name }),
+    });
+    if (!res.ok) throw new Error((await res.json()).detail || 'Failed to create group');
+    document.getElementById('grp-slug').value = '';
+    document.getElementById('grp-name').value = '';
+    await renderManageGroupsList();
+    await loadProjects();
+  } catch (e) {
+    errEl.textContent = e.message;
+    errEl.classList.remove('hidden');
+  }
+}
+
+async function assignProjectGroup(slug, groupSlug) {
+  await fetch(`/api/projects/${slug}/group`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ group_slug: groupSlug }),
+  });
+  await loadProjects();
+}
+
+async function removeGroupClick(slug) {
+  if (!confirm(`Delete group "${slug}"? Member repos will be ungrouped (not removed).`)) return;
+  await fetch(`/api/projects/groups/${slug}`, { method: 'DELETE' });
+  await renderManageGroupsList();
+  await loadProjects();
 }
 
 // ── register server modal ─────────────────────────────────────────────────────
