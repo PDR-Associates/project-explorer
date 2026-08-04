@@ -37,6 +37,16 @@ class Project:
     parent_slug: str = ""       # slug of the parent project when this is a sub-project
     extra_docs_paths: list[str] = field(default_factory=list)  # repo-relative paths outside subproject_path to ingest as docs/examples
     egeria_asset_guid: str = ""  # GUID of the SourceControlLibrary asset in Egeria; "" = not yet published
+    group_slug: str = ""  # slug of the umbrella project group this repo belongs to; "" = ungrouped
+
+
+@dataclass
+class ProjectGroup:
+    """An umbrella grouping of related repos, e.g. 'egeria' containing egeria, egeria-python, egeria-advisor."""
+    slug: str
+    display_name: str
+    description: str = ""
+    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
 @dataclass
@@ -127,7 +137,8 @@ class ProjectRegistry:
                     subproject_path TEXT DEFAULT '',
                     parent_slug TEXT DEFAULT '',
                     extra_docs_paths TEXT DEFAULT '[]',
-                    egeria_asset_guid TEXT DEFAULT NULL
+                    egeria_asset_guid TEXT DEFAULT NULL,
+                    group_slug TEXT DEFAULT ''
                 )
             """)
             # Migrations: add new columns to existing databases
@@ -138,9 +149,18 @@ class ProjectRegistry:
                 ("parent_slug", "TEXT DEFAULT ''"),
                 ("extra_docs_paths", "TEXT DEFAULT '[]'"),
                 ("egeria_asset_guid", "TEXT DEFAULT NULL"),
+                ("group_slug", "TEXT DEFAULT ''"),
             ]:
                 if col not in existing:
                     conn.execute(f"ALTER TABLE projects ADD COLUMN {col} {defn}")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS project_groups (
+                    slug TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+            """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS project_stats (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -477,7 +497,7 @@ class ProjectRegistry:
                     :docs_url, :github_token_encrypted, :collections, :status,
                     :last_indexed_at, :last_stats_fetched_at, :last_commit_sha,
                     :created_at, :error_message, :subproject_path, :parent_slug,
-                    :extra_docs_paths, :egeria_asset_guid
+                    :extra_docs_paths, :egeria_asset_guid, :group_slug
                 )""",
                 data,
             )
@@ -618,6 +638,92 @@ class ProjectRegistry:
             conn.execute("DELETE FROM project_code_symbols WHERE project_slug = ?", (normalized,))
             conn.execute("DELETE FROM project_aliases WHERE project_slug = ?", (normalized,))
             conn.execute("DELETE FROM project_contributor_stats WHERE project_slug = ?", (normalized,))
+
+    # ── project groups ────────────────────────────────────────────────────────
+
+    def create_group(self, slug: str, display_name: str, description: str = "") -> None:
+        """Create (or update the display name/description of) an umbrella project group."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO project_groups (slug, display_name, description, created_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(slug) DO UPDATE SET
+                     display_name = excluded.display_name,
+                     description = excluded.description""",
+                (slug, display_name, description, datetime.utcnow().isoformat()),
+            )
+
+    def get_group(self, slug: str) -> ProjectGroup | None:
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM project_groups WHERE slug = ?", (slug,)
+            ).fetchone()
+        return ProjectGroup(**dict(row)) if row else None
+
+    def list_groups(self) -> list[ProjectGroup]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM project_groups ORDER BY display_name"
+            ).fetchall()
+        return [ProjectGroup(**dict(r)) for r in rows]
+
+    def delete_group(self, slug: str) -> int:
+        """Delete a group and unassign all its member projects. Returns member count unassigned."""
+        slug = self._normalize_slug(slug)
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "UPDATE projects SET group_slug = '' WHERE group_slug = ?", (slug,)
+            )
+            unassigned = cursor.rowcount
+            conn.execute("DELETE FROM project_groups WHERE slug = ?", (slug,))
+        return unassigned
+
+    def set_project_group(self, project_slug: str, group_slug: str) -> None:
+        """Assign (or clear, with group_slug='') the group a project belongs to."""
+        project_slug = self._normalize_slug(project_slug)
+        group_slug = self._normalize_slug(group_slug) if group_slug else ""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE projects SET group_slug = ? WHERE slug = ?",
+                (group_slug, project_slug),
+            )
+
+    def list_projects_in_group(self, group_slug: str) -> list[Project]:
+        group_slug = self._normalize_slug(group_slug)
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM projects WHERE group_slug = ? ORDER BY display_name",
+                (group_slug,),
+            ).fetchall()
+        return [self._row_to_project(r) for r in rows]
+
+    def get_group_aggregate_stats(self, group_slug: str) -> dict:
+        """Sum the latest project_stats snapshot across every member of a group.
+
+        Contributor counts are not summed (the same person often contributes to
+        multiple repos in a group) — the max across members is reported instead.
+        """
+        members = self.list_projects_in_group(group_slug)
+        totals = {
+            "project_count": len(members),
+            "stars": 0, "forks": 0, "watchers": 0, "open_issues": 0,
+            "commits_30d": 0, "commits_90d": 0,
+            "contributors_count": 0,
+            "languages": {},
+        }
+        for m in members:
+            snap = self.get_latest_project_stats(m.slug)
+            if not snap:
+                continue
+            for key in ("stars", "forks", "watchers", "open_issues", "commits_30d", "commits_90d"):
+                totals[key] += snap.get(key) or 0
+            totals["contributors_count"] = max(totals["contributors_count"], snap.get("contributors_count") or 0)
+            lang = snap.get("primary_language")
+            if lang:
+                totals["languages"][lang] = totals["languages"].get(lang, 0) + 1
+        return totals
 
     # ── alias management ──────────────────────────────────────────────────────
 
